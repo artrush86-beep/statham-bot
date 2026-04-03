@@ -30,7 +30,7 @@ TG_TOPIC  = os.environ.get("TG_TOPIC", "")            # ID темы сигнал
 # Разрешённые пары (через запятую в env): EDGEUSDT,YBUSDT,ARIAUSDT
 ALLOWED_PAIRS = set(
     p.strip().upper().replace(".P", "")
-    for p in os.environ.get("ALLOWED_PAIRS", "EDGEUSDT,STOUSDT,ASTERUSDT").split(",")
+    for p in os.environ.get("ALLOWED_PAIRS", "ASTERUSDT,EDGEUSDT,STOUSDT,BTCUSDT").split(",")
     if p.strip()
 )
 
