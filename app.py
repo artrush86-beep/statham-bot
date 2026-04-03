@@ -27,7 +27,7 @@ TG_TOKEN  = os.environ.get("TG_TOKEN", "")
 TG_CHAT   = os.environ.get("TG_CHAT", "")
 TG_TOPIC  = os.environ.get("TG_TOPIC", "")            # ID темы сигналов (опционально)
 
-# Разрешённые пары (через запятую в env): BTCUSDT,ETHUSDT,SOLUSDT
+# Разрешённые пары (через запятую в env): EDGEUSDT,YBUSDT,ARIAUSDT
 ALLOWED_PAIRS = set(
     p.strip().upper().replace(".P", "")
     for p in os.environ.get("ALLOWED_PAIRS", "BTCUSDT,ETHUSDT,SOLUSDT").split(",")
