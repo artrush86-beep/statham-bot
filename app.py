@@ -50,7 +50,6 @@ TP_CLOSE_PCT = {1: 0.25, 2: 0.20, 3: 0.25, 4: 0.15, 5: 0.10, 6: 0.05}
 
 # Trailing: % от текущей цены для трейлинг-стопа
 TRAIL_PCT = float(os.environ.get("TRAIL_PCT", "0.5")) / 100.0   # 0.5% по умолчанию
-PA_FORWARD_URL = os.environ.get("PA_FORWARD_URL", "")
 
 # Файлы состояния (в /tmp — живут пока процесс жив; при рестарте Render — пересоздаются)
 STATE_FILE = "/tmp/positions.json"
