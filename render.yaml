@@ -1,0 +1,33 @@
+services:
+  - type: web
+    name: statham-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 1 --threads 4 --timeout 120
+    envVars:
+      - key: BYBIT_API_KEY
+        sync: false          # вводишь вручную в Render Dashboard
+      - key: BYBIT_API_SECRET
+        sync: false
+      - key: TESTNET
+        value: "true"        # ← TESTNET! Меняешь на "false" для реального
+      - key: RENDER_SECRET
+        generateValue: true  # Render сам сгенерирует случайный секрет
+      - key: RENDER_URL
+        sync: false          # вставишь свой URL после деплоя
+      - key: TG_TOKEN
+        sync: false
+      - key: TG_CHAT
+        sync: false
+      - key: TG_TOPIC
+        sync: false          # ID ветки сигналов в Telegram (можно пусто)
+      - key: ALLOWED_PAIRS
+        value: "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT"
+      - key: DEFAULT_LEVERAGE
+        value: "10"
+      - key: DEFAULT_SIZE_USDT
+        value: "50"
+      - key: TRAIL_PCT
+        value: "0.5"         # 0.5% трейлинг после TP3
+      - key: PAIR_SETTINGS_JSON
+        value: '{}'          # пример: '{"BTCUSDT":{"leverage":10,"size_usdt":100}}'
