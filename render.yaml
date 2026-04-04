@@ -46,7 +46,7 @@ services:
 
       # ── Торговля ──────────────────────────────────────────────────
       - key: ALLOWED_PAIRS
-        value: "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT"
+        value: "YBUSDT,ASTERUSDT,EDGEUSDT,STOUSDT"
       - key: DEFAULT_LEVERAGE
         value: "10"
       - key: DEFAULT_SIZE_USDT
