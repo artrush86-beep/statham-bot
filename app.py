@@ -19,7 +19,7 @@ log = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════════════════════
 BYBIT_API_KEY    = os.environ.get("BYBIT_API_KEY", "")
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
-TESTNET          = os.environ.get("TESTNET", "true").lower() == "true"
+TESTNET          = os.environ.get("TESTNET", "false").lower() == "false"
 RENDER_SECRET    = os.environ.get("RENDER_SECRET", "statham_bot_secret")
 RENDER_URL       = os.environ.get("RENDER_URL", "")   # своя ссылка для keepalive
 
