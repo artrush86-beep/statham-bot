@@ -36,7 +36,7 @@ ALLOWED_PAIRS = set(
 
 # Настройки по умолчанию для всех пар
 DEFAULT_LEVERAGE  = int(os.environ.get("DEFAULT_LEVERAGE", "10"))
-DEFAULT_SIZE_USDT = float(os.environ.get("DEFAULT_SIZE_USDT", "50"))
+DEFAULT_SIZE_USDT = float(os.environ.get("DEFAULT_SIZE_USDT", "2"))
 
 # Настройки по парам (JSON в env):
 # '{"BTCUSDT":{"leverage":10,"size_usdt":100},"SOLUSDT":{"leverage":5,"size_usdt":30}}'
