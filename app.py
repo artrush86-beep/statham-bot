@@ -534,7 +534,7 @@ def cleanup_old_trades() -> int:
 # ОБРАБОТЧИКИ СИГНАЛОВ (TG уведомление + Bybit исполнение)
 # ══════════════════════════════════════════════════════════════════════════════
 def handle_entry(payload: dict):
-    ticker    = payload.get("ticker", "").replace(".P", "").upper()
+    ticker = payload.get("ticker", "").upper().replace(".P", "")
     direction = payload.get("direction", "").upper()
     text      = payload.get("text", "").strip()
     trade_id  = str(payload.get("trade_id") or "")
@@ -647,7 +647,7 @@ def handle_entry(payload: dict):
 
 
 def handle_tp_hit(payload: dict):
-    ticker    = payload.get("ticker", "").replace(".P", "").upper()
+    ticker = payload.get("ticker", "").upper().replace(".P", "")
     direction = (payload.get("direction") or "").upper()
     tp_num    = int(payload.get("tp_num") or 0)
     text      = payload.get("text", "").strip()
@@ -716,7 +716,7 @@ def handle_tp_hit(payload: dict):
 
 
 def handle_sl_hit(payload: dict):
-    ticker    = payload.get("ticker", "").replace(".P", "").upper()
+    ticker = payload.get("ticker", "").upper().replace(".P", "")
     direction = (payload.get("direction") or "").upper()
     text      = payload.get("text", "").strip()
     key       = build_trade_key(payload)
@@ -738,7 +738,7 @@ def handle_sl_hit(payload: dict):
 
 
 def handle_sl_moved(payload: dict):
-    ticker    = payload.get("ticker", "").replace(".P", "").upper()
+    ticker = payload.get("ticker", "").upper().replace(".P", "")
     direction = (payload.get("direction") or "").upper()
     text      = payload.get("text", "").strip()
     key       = build_trade_key(payload)
