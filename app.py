@@ -78,7 +78,7 @@ ADMIN_IDS = set(
 
 ALLOWED_PAIRS = set(
     p.strip().upper().replace(".P", "")
-    for p in os.environ.get("ALLOWED_PAIRS", "ASTERUSDT,EDGEUSDT,STOUSDT").split(",")
+    for p in os.environ.get("ALLOWED_PAIRS", "YBUSDT,ASTERUSDT,EDGEUSDT,STOUSDT").split(",")
     if p.strip()
 )
 
