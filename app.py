@@ -23,8 +23,6 @@ Statham Trading Bot — RENDER (Unified v2.0)
   TG_CHAT             — ID чата (-100...)
   TG_SIGNALS_TOPIC    — ID ветки сигналов
   TG_SESSIONS_TOPIC   — ID ветки сессий/F&G
-  WEBHOOK_SECRET      — секрет для /webhook/bybit (ОБЯЗАТЕЛЬНО!)
-  RENDER_SECRET       — секрет для admin-эндпоинтов  (ОБЯЗАТЕЛЬНО!)
   RENDER_URL          — свой URL на Render (для keepalive)
   ADMIN_IDS           — через запятую: 123456,789012
 
@@ -76,10 +74,6 @@ TG_CHAT           = os.environ.get("TG_CHAT",           "")
 TG_SIGNALS_TOPIC  = os.environ.get("TG_SIGNALS_TOPIC",  "6314")
 TG_SESSIONS_TOPIC = os.environ.get("TG_SESSIONS_TOPIC", "1")
 RENDER_URL        = os.environ.get("RENDER_URL",        "")
-
-# Секреты
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-RENDER_SECRET  = os.environ.get("RENDER_SECRET",  "")
 
 TESTNET = os.environ.get("TESTNET", "true").lower() == "true"
 
