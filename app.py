@@ -490,8 +490,7 @@ def get_bybit_balance() -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 # BINGX КЛИЕНТ
 # ══════════════════════════════════════════════════════════════════════════════
-BINGX_BASE = "https://open-api.bingx.com"
-
+BINGX_BASE = "https://open-api-vst.bingx.com" if BINGX_DEMO else "https://open-api.bingx.com"
 
 def _bingx_to_symbol(ticker: str) -> str:
     """BTCUSDT → BTC-USDT"""
