@@ -516,8 +516,6 @@ def _bingx_req(method: str, path: str, params: dict | None = None) -> dict:
     params["signature"] = _bingx_sign(params)
     url     = BINGX_BASE + path
     headers = {"X-BX-APIKEY": BINGX_API_KEY}
-    if BINGX_DEMO:
-        headers["X-BX-DEMO-API"] = "1"
     if method == "GET":
         resp = requests.get(url, params=params, headers=headers, timeout=10)
     elif method == "POST":
