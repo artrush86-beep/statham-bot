@@ -492,6 +492,7 @@ def get_bybit_balance() -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 BINGX_BASE = "https://open-api-vst.bingx.com" if BINGX_DEMO else "https://open-api.bingx.com"
 
+
 def _bingx_to_symbol(ticker: str) -> str:
     """BTCUSDT → BTC-USDT"""
     t = ticker.upper().replace(".P", "")
@@ -1261,14 +1262,12 @@ def _scheduler():
                     open_min  = oh * 60 + om
                     close_min = ch * 60 + cm
 
-                    # Открытие сессии (без предупреждения за 15 мин)
                     if -1 <= open_min - cur <= 1:
                         k = f"sess_open_{today}_{s['open']}"
                         if not _was_sent(k):
                             _mark_sent(k)
                             send_sessions(f"🟢 {s['name']} открылась! ({s['open']} МСК)")
 
-                    # Закрытие сессии
                     is_midnight = (ch == 0 and cm == 0)
                     at_close    = (-1 <= cur <= 1) if is_midnight else (-1 <= close_min - cur <= 1)
                     if at_close:
