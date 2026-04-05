@@ -17,11 +17,6 @@ services:
       - key: TG_SESSIONS_TOPIC
         value: "1"           # ID ветки сессий и F&G
 
-      # ── Webhook ───────────────────────────────────────────────────
-      - key: WEBHOOK_SECRET
-        sync: false               # ← задаётся только в Render Dashboard
-      - key: RENDER_SECRET
-        generateValue: true  # авто-генерация — посмотреть в Render Dashboard → Environment
 
       # ── Render ────────────────────────────────────────────────────
       - key: RENDER_URL
