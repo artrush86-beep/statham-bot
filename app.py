@@ -152,13 +152,7 @@ bot = telebot.TeleBot(TG_TOKEN, threaded=False) if TG_TOKEN else None
 # СТАРТОВЫЕ ПРЕДУПРЕЖДЕНИЯ
 # ══════════════════════════════════════════════════════════════════════════════
 def _startup_warnings():
-    if not RENDER_SECRET:
-        log.warning("SECURITY WARNING: RENDER_SECRET не задан! "
-                    "Admin-эндпоинты /debug /trades /stats /history /positions /close_all "
-                    "доступны без авторизации. Установи RENDER_SECRET в Render Dashboard.")
-    if not WEBHOOK_SECRET:
-        log.warning("SECURITY WARNING: WEBHOOK_SECRET не задан! "
-                    "/webhook/bybit принимает сигналы от кого угодно.")
+    # Секреты не используются
     if not TESTNET and (BYBIT_AVAILABLE or BINGX_AVAILABLE):
         log.warning("LIVE TRADING ACTIVE! TESTNET=false — торговля реальными деньгами!")
     if BYBIT_AVAILABLE:
@@ -173,12 +167,8 @@ _startup_warnings()
 # БЕЗОПАСНОСТЬ
 # ══════════════════════════════════════════════════════════════════════════════
 def _http_auth(req) -> bool:
-    """Проверяет RENDER_SECRET. На LIVE без секрета — блокируем всё."""
-    token = req.headers.get("X-Secret") or req.args.get("secret", "")
-    if RENDER_SECRET:
-        return token == RENDER_SECRET
-    # Если секрет не задан — пускаем только в testnet (предупреждение при старте)
-    return TESTNET
+    """Авторизация отключена — все эндпоинты открыты."""
+    return True
 
 
 _rate_store: dict[str, list[float]] = {}
@@ -1679,9 +1669,7 @@ def bybit_webhook():
     secret_from_header = request.headers.get("X-Secret", "")
     incoming_secret    = secret_from_body or secret_from_header
 
-    if WEBHOOK_SECRET and incoming_secret != WEBHOOK_SECRET:
-        write_log(f"WEBHOOK_FORBIDDEN | ip={client_ip}")
-        return jsonify({"error": "forbidden"}), 403
+    # Проверка WEBHOOK_SECRET отключена — принимаем все POST запросы
 
     # Ранняя фильтрация по тикеру
     ticker = payload.get("ticker", "").upper().replace(".P", "")
@@ -1698,8 +1686,7 @@ def bybit_webhook():
 
 @app.route("/webhook/<secret>", methods=["POST"])
 def bybit_webhook_compat(secret: str):
-    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
-        return jsonify({"error": "forbidden"}), 403
+    # Проверка секрета отключена
     raw = request.get_data(as_text=True).strip()
     if not raw:
         return jsonify({"status": "ok", "event": "ping"}), 200
