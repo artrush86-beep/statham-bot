@@ -589,15 +589,25 @@ def bingx_cancel_all(ticker: str):
     except Exception as e:
         write_log(f"BINGX_CANCEL_ERR | {ticker} | {e}")
 
-
 def get_bingx_balance() -> str:
     try:
-        data = _bingx_req("GET", "/openApi/swap/v3/user/balance")
-        # Ответ: {"data": {"balance": {"equity": "...", "availableMargin": "..."}}}
-        balance = data.get("data", {}).get("balance", {})
-        equity = balance.get("equity", "?")
-        avail  = balance.get("availableMargin", "?")
-        mode   = "🧪 DEMO" if BINGX_DEMO else "🔴 LIVE"
+        if BINGX_DEMO:
+            data = _bingx_req("GET", "/openApi/swap/v2/user/balance")
+            # balance — это список, берём первый элемент
+            balance_data = data.get("data", {}).get("balance", [])
+            if isinstance(balance_data, list):
+                d = balance_data[0] if balance_data else {}
+            else:
+                d = balance_data
+            equity = d.get("equity", "?")
+            avail  = d.get("availableMargin", "?")
+        else:
+            data     = _bingx_req("GET", "/openApi/account/v3/balance")
+            balances = data.get("data", {}).get("balance", {})
+            equity   = balances.get("equity", "?")
+            avail    = balances.get("availableMargin", "?")
+
+        mode = "🧪 DEMO" if BINGX_DEMO else "🔴 LIVE"
         return (f"💰 <b>BingX</b> {mode}\n"
                 f"Equity: <b>{float(equity):.2f} USDT</b>\n"
                 f"Доступно: <b>{float(avail):.2f} USDT</b>")
