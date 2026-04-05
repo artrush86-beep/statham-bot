@@ -5,48 +5,37 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app --workers 1 --threads 4 --timeout 120
 
-    # Раскомментируй для постоянного хранения данных (Render Disk addon):
-    # disk:
-    #   name: statham-data
-    #   mountPath: /data
-    #   sizeGB: 1
-
     envVars:
-      # ── Telegram ──────────────────────────────────────────────────
       - key: TG_TOKEN
-        sync: false          # токен основного бота (Statham Master)
+        sync: false
       - key: TG_CHAT
-        sync: false          # ID чата: -1003867089540
+        sync: false
       - key: TG_SIGNALS_TOPIC
-        value: "6314"        # ID ветки сигналов
+        value: "6314"
       - key: TG_SESSIONS_TOPIC
-        value: "1"           # ID ветки сессий и F&G
-
-      # ── Webhook ───────────────────────────────────────────────────
+        value: "1"
       - key: WEBHOOK_SECRET
-        value: "statham_secret"   # секрет для TradingView → /webhook/bybit
+        value: "statham_secret"
       - key: RENDER_SECRET
-        generateValue: true       # защита для /close_all /positions /test_bybit (?secret=XXX)
-
-      # ── Render ────────────────────────────────────────────────────
+        generateValue: true
       - key: RENDER_URL
-        sync: false          # https://statham-bot-dpvt.onrender.com
-
-      # ── Bybit ─────────────────────────────────────────────────────
+        sync: false
       - key: BYBIT_API_KEY
         sync: false
       - key: BYBIT_API_SECRET
         sync: false
-      - key: TESTNET
-        value: "true"        # ← сменить на "false" для реального торговля
-
-      # ── Администраторы ────────────────────────────────────────────
-      - key: ADMIN_IDS
-        sync: false          # твои Telegram user_id через запятую
-
-      # ── Торговля ──────────────────────────────────────────────────
-      - key: ALLOWED_PAIRS
+      - key: BYBIT_TESTNET
+        value: "false"
+      - key: BYBIT_PAIRS
         value: "YBUSDT,ASTERUSDT,EDGEUSDT,STOUSDT"
+      - key: BINGX_API_KEY
+        sync: false
+      - key: BINGX_API_SECRET
+        sync: false
+      - key: BINGX_PAIRS
+        value: ""
+      - key: ADMIN_IDS
+        sync: false
       - key: DEFAULT_LEVERAGE
         value: "10"
       - key: DEFAULT_SIZE_USDT
@@ -55,7 +44,5 @@ services:
         value: "0.5"
       - key: PAIR_SETTINGS_JSON
         value: '{}'
-
-      # ── Хранилище ─────────────────────────────────────────────────
       - key: DATA_DIR
-        value: "/tmp"        # ← сменить на "/data" если добавишь Render Disk
+        value: "/tmp"
