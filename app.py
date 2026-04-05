@@ -592,11 +592,12 @@ def bingx_cancel_all(ticker: str):
 
 def get_bingx_balance() -> str:
     try:
-        data     = _bingx_req("GET", "/openApi/account/v3/balance")
-        balances = data.get("data", {}).get("balance", {})
-        equity   = balances.get("equity", "?")
-        avail    = balances.get("availableMargin", "?")
-        mode     = "🧪 DEMO" if BINGX_DEMO else "🔴 LIVE"
+        data = _bingx_req("GET", "/openApi/swap/v3/user/balance")
+        # Ответ: {"data": {"balance": {"equity": "...", "availableMargin": "..."}}}
+        balance = data.get("data", {}).get("balance", {})
+        equity = balance.get("equity", "?")
+        avail  = balance.get("availableMargin", "?")
+        mode   = "🧪 DEMO" if BINGX_DEMO else "🔴 LIVE"
         return (f"💰 <b>BingX</b> {mode}\n"
                 f"Equity: <b>{float(equity):.2f} USDT</b>\n"
                 f"Доступно: <b>{float(avail):.2f} USDT</b>")
