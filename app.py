@@ -311,18 +311,23 @@ def send_tg(text: str, thread_id=None, chat_id=None, reply_to=None) -> dict:
             "message_id": reply_to,
             "allow_sending_without_reply": True,
         }
-    try:
-        resp = requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json=payload, timeout=10,
-        )
-        data = resp.json()
-        if not data.get("ok"):
-            raise RuntimeError(f"TG error: {data.get('description')}")
-        return data["result"]
-    except Exception as e:
-        write_log(f"SEND_TG_ERR | {e}")
-        return {}
+    for attempt in range(3):
+        try:
+            resp = requests.post(
+                f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                json=payload, timeout=15,
+            )
+            data = resp.json()
+            if not data.get("ok"):
+                write_log(f"SEND_TG_FAIL | attempt={attempt} | {data.get('description')}")
+                time.sleep(2)
+                continue
+            write_log(f"SEND_TG_OK | chat={chat_id} thread={thread_id}")
+            return data["result"]
+        except Exception as e:
+            write_log(f"SEND_TG_ERR | attempt={attempt} | {e}")
+            time.sleep(2)
+    return {}
 
 
 def send_signals(text: str, reply_to=None) -> dict:
