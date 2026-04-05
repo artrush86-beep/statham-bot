@@ -8,9 +8,9 @@ services:
     envVars:
       # ── Telegram ──────────────────────────────────────────────────
       - key: TG_TOKEN
-        sync: false          # токен основного бота
+        sync: false          # токен бота 8241319215:AAHHLVM-...
       - key: TG_CHAT
-        sync: false          # ID чата: -1003867089540
+        sync: false          # -1003867089540
       - key: TG_SIGNALS_TOPIC
         value: "6314"        # ID ветки сигналов
       - key: TG_SESSIONS_TOPIC
@@ -18,50 +18,54 @@ services:
 
       # ── Webhook ───────────────────────────────────────────────────
       - key: WEBHOOK_SECRET
-        sync: false          # ⚠️ ПОМЕНЯЙ! Используй длинную случайную строку
+        sync: false          # ⚠️ придумай длинную строку, например: statham_elite_2024
       - key: RENDER_SECRET
-        generateValue: true  # авто-генерация секрета для admin-эндпоинтов
-                             # посмотреть значение: Render Dashboard → Environment
+        generateValue: true  # авто-генерация — посмотреть в Render Dashboard → Environment
 
       # ── Render ────────────────────────────────────────────────────
       - key: RENDER_URL
         sync: false          # https://statham-bot-dpvt.onrender.com
 
-      # ── Bybit ─────────────────────────────────────────────────────
+      # ── Bybit (РЕАЛЬНЫЕ ДЕНЬГИ) ───────────────────────────────────
       - key: BYBIT_API_KEY
         sync: false
       - key: BYBIT_API_SECRET
         sync: false
       - key: TESTNET
-        value: "false"       # true = тестнет, false = реальная торговля
+        value: "false"       # false = реальная торговля
       - key: BYBIT_PAIRS
-        value: "YBUSDT,STOUSDT"   # пары ТОЛЬКО для Bybit
+        value: "YBUSDT,STOUSDT"
 
-      # ── BingX ─────────────────────────────────────────────────────
+      # ── BingX (ДЕМО) ──────────────────────────────────────────────
       - key: BINGX_API_KEY
         sync: false
       - key: BINGX_API_SECRET
         sync: false
       - key: BINGX_DEMO
-        value: "false"       # true = демо-счёт BingX
+        value: "true"        # true = демо-счёт
       - key: BINGX_PAIRS
-        value: "ASTERUSDT,EDGEUSDT"  # пары ТОЛЬКО для BingX
+        value: "ASTERUSDT,EDGEUSDT"
 
       # ── Администраторы ────────────────────────────────────────────
       - key: ADMIN_IDS
-        sync: false          # твой Telegram user_id (через запятую если несколько)
+        sync: false          # твой Telegram user_id: 7617558315
 
-      # ── Торговля (общее) ──────────────────────────────────────────
+      # ── Торговля — глобальные дефолты (перекрываются в коде) ──────
       - key: DEFAULT_LEVERAGE
         value: "10"
       - key: DEFAULT_SIZE_USDT
         value: "1"
       - key: TRAIL_PCT
         value: "0.5"
+
+      # ── Настройки по паре (перекрывают дефолты биржи) ────────────
+      # Bybit: 10x / 1 USDT | BingX: 20x / 30 USDT (задано в коде)
+      # Здесь можно добавить исключения для конкретных пар:
       - key: PAIR_SETTINGS_JSON
         value: '{}'
-        # Пример: '{"BTCUSDT":{"leverage":20,"size_usdt":5},"ASTERUSDT":{"leverage":5,"size_usdt":2}}'
+        # Пример переопределения:
+        # '{"YBUSDT":{"leverage":15,"size_usdt":2}}'
 
       # ── Хранилище ─────────────────────────────────────────────────
       - key: DATA_DIR
-        value: "/tmp"        # ← сменить на "/data" если добавишь Render Disk
+        value: "/tmp"
