@@ -6,36 +6,52 @@ services:
     startCommand: gunicorn app:app --workers 1 --threads 4 --timeout 120
 
     envVars:
+      # ── Telegram ──────────────────────────────────────────────────
       - key: TG_TOKEN
-        sync: false
+        sync: false          # токен основного бота
       - key: TG_CHAT
-        sync: false
+        sync: false          # ID чата: -1003867089540
       - key: TG_SIGNALS_TOPIC
-        value: "6314"
+        value: "6314"        # ID ветки сигналов
       - key: TG_SESSIONS_TOPIC
-        value: "1"
+        value: "1"           # ID ветки сессий и F&G
+
+      # ── Webhook ───────────────────────────────────────────────────
       - key: WEBHOOK_SECRET
-        value: "statham_secret"
+        sync: false          # ⚠️ ПОМЕНЯЙ! Используй длинную случайную строку
       - key: RENDER_SECRET
-        generateValue: true
+        generateValue: true  # авто-генерация секрета для admin-эндпоинтов
+                             # посмотреть значение: Render Dashboard → Environment
+
+      # ── Render ────────────────────────────────────────────────────
       - key: RENDER_URL
-        sync: false
+        sync: false          # https://statham-bot-dpvt.onrender.com
+
+      # ── Bybit ─────────────────────────────────────────────────────
       - key: BYBIT_API_KEY
         sync: false
       - key: BYBIT_API_SECRET
         sync: false
-      - key: BYBIT_TESTNET
-        value: "false"
+      - key: TESTNET
+        value: "false"       # true = тестнет, false = реальная торговля
       - key: BYBIT_PAIRS
-        value: "YBUSDT,ASTERUSDT,EDGEUSDT,STOUSDT"
+        value: "YBUSDT,STOUSDT"   # пары ТОЛЬКО для Bybit
+
+      # ── BingX ─────────────────────────────────────────────────────
       - key: BINGX_API_KEY
         sync: false
       - key: BINGX_API_SECRET
         sync: false
+      - key: BINGX_DEMO
+        value: "false"       # true = демо-счёт BingX
       - key: BINGX_PAIRS
-        value: ""
+        value: "ASTERUSDT,EDGEUSDT"  # пары ТОЛЬКО для BingX
+
+      # ── Администраторы ────────────────────────────────────────────
       - key: ADMIN_IDS
-        sync: false
+        sync: false          # твой Telegram user_id (через запятую если несколько)
+
+      # ── Торговля (общее) ──────────────────────────────────────────
       - key: DEFAULT_LEVERAGE
         value: "10"
       - key: DEFAULT_SIZE_USDT
@@ -44,5 +60,8 @@ services:
         value: "0.5"
       - key: PAIR_SETTINGS_JSON
         value: '{}'
+        # Пример: '{"BTCUSDT":{"leverage":20,"size_usdt":5},"ASTERUSDT":{"leverage":5,"size_usdt":2}}'
+
+      # ── Хранилище ─────────────────────────────────────────────────
       - key: DATA_DIR
-        value: "/tmp"
+        value: "/tmp"        # ← сменить на "/data" если добавишь Render Disk
