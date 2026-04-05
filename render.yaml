@@ -19,7 +19,7 @@ services:
 
       # ── Webhook ───────────────────────────────────────────────────
       - key: WEBHOOK_SECRET
-        sync: true          # ⚠️ придумай длинную строку, например: statham_elite_2024
+        sync: false               # ← задаётся только в Render Dashboard
       - key: RENDER_SECRET
         generateValue: true  # авто-генерация — посмотреть в Render Dashboard → Environment
 
