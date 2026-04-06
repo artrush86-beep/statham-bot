@@ -70,9 +70,9 @@ log = logging.getLogger(__name__)
 # КОНФИГУРАЦИЯ
 # ══════════════════════════════════════════════════════════════════════════════
 TG_TOKEN          = os.environ.get("TG_TOKEN",          "")
-TG_CHAT           = os.environ.get("TG_CHAT",           "-1003867089540")
+TG_CHAT           = os.environ.get("TG_CHAT",           "")
 TG_SIGNALS_TOPIC  = os.environ.get("TG_SIGNALS_TOPIC",  "6314")
-TG_SESSIONS_TOPIC = os.environ.get("TG_SESSIONS_TOPIC", "6314")
+TG_SESSIONS_TOPIC = os.environ.get("TG_SESSIONS_TOPIC", "1")
 RENDER_URL        = os.environ.get("RENDER_URL",        "")
 
 TESTNET = os.environ.get("TESTNET", "true").lower() == "true"
@@ -491,7 +491,9 @@ def _bingx_to_symbol(ticker: str) -> str:
 
 
 def _bingx_sign(params: dict) -> str:
-    query = "&".join(f"{k}={params[k]}" for k in sorted(params))
+    # BingX требует строку без сортировки, в том порядке как параметры добавлялись
+    # Но поскольку dict в Python 3.7+ сохраняет порядок, используем items()
+    query = "&".join(f"{k}={v}" for k, v in params.items())
     return _hmac.new(
         BINGX_API_SECRET.encode("utf-8"),
         query.encode("utf-8"),
