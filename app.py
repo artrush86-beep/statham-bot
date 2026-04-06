@@ -109,6 +109,7 @@ ALLOWED_PAIRS = BYBIT_PAIRS | BINGX_PAIRS
 
 DEFAULT_LEVERAGE  = int(os.environ.get("DEFAULT_LEVERAGE",  "10"))
 DEFAULT_SIZE_USDT = float(os.environ.get("DEFAULT_SIZE_USDT", "1"))
+TRAIL_PCT         = float(os.environ.get("TRAIL_PCT","0.5")) / 100.0
 
 try:
     PAIR_SETTINGS: dict = json.loads(os.environ.get("PAIR_SETTINGS_JSON", "{}"))
