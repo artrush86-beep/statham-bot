@@ -18,6 +18,11 @@ def post_fork(server, worker):
         daemon=True, name="scheduler"
     ).start()
 
+    threading.Thread(
+        target=application._keepalive,
+        daemon=True, name="keepalive"
+    ).start()
+
     if application.BYBIT_AVAILABLE or application.BINGX_AVAILABLE:
         threading.Thread(
             target=application._position_manager,
