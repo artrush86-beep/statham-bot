@@ -15,7 +15,7 @@ services:
       - key: TG_SIGNALS_TOPIC
         value: "6314"        # ID ветки сигналов
       - key: TG_SESSIONS_TOPIC
-        value: "1"           # ID ветки сессий и F&G
+        value: "6314"           # ID ветки сессий и F&G
 
 
       # ── Render ────────────────────────────────────────────────────
