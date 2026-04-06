@@ -70,9 +70,9 @@ log = logging.getLogger(__name__)
 # КОНФИГУРАЦИЯ
 # ══════════════════════════════════════════════════════════════════════════════
 TG_TOKEN          = os.environ.get("TG_TOKEN",          "")
-TG_CHAT           = os.environ.get("TG_CHAT",           "")
+TG_CHAT           = os.environ.get("TG_CHAT",           "-1003867089540")
 TG_SIGNALS_TOPIC  = os.environ.get("TG_SIGNALS_TOPIC",  "6314")
-TG_SESSIONS_TOPIC = os.environ.get("TG_SESSIONS_TOPIC", "1")
+TG_SESSIONS_TOPIC = os.environ.get("TG_SESSIONS_TOPIC", "6314")
 RENDER_URL        = os.environ.get("RENDER_URL",        "")
 
 TESTNET = os.environ.get("TESTNET", "true").lower() == "true"
