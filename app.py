@@ -506,15 +506,21 @@ def _bingx_req(method: str, path: str, params: dict | None = None) -> dict:
     if params is None:
         params = {}
     params["timestamp"] = str(int(time.time() * 1000))
-    params["signature"] = _bingx_sign(params)
-    url     = BINGX_BASE + path
+    # Строим строку запроса в том же порядке что и подпись
+    query = "&".join(f"{k}={params[k]}" for k in params)
+    sig   = _hmac.new(
+        BINGX_API_SECRET.encode("utf-8"),
+        query.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    url     = BINGX_BASE + path + "?" + query + "&signature=" + sig
     headers = {"X-BX-APIKEY": BINGX_API_KEY}
     if method == "GET":
-        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        resp = requests.get(url, headers=headers, timeout=10)
     elif method == "POST":
-        resp = requests.post(url, params=params, headers=headers, timeout=10)
+        resp = requests.post(url, headers=headers, timeout=10)
     elif method == "DELETE":
-        resp = requests.delete(url, params=params, headers=headers, timeout=10)
+        resp = requests.delete(url, headers=headers, timeout=10)
     else:
         raise ValueError(f"Unknown method: {method}")
     data = resp.json()
