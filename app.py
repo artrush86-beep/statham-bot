@@ -55,6 +55,13 @@ from flask import Flask, request, jsonify
 import requests
 import telebot
 
+# ── Redis (Upstash) ────────────────────────────────────────────────────────────
+try:
+    import redis as _redis_lib
+    _REDIS_AVAILABLE = True
+except ImportError:
+    _REDIS_AVAILABLE = False
+
 # ── Bybit ──────────────────────────────────────────────────────────────────────
 try:
     from pybit.unified_trading import HTTP as BybitHTTP
@@ -121,6 +128,36 @@ TP_CLOSE_PCT = {1: 0.25, 2: 0.20, 3: 0.25, 4: 0.15, 5: 0.10, 6: 0.05}
 
 DATA_DIR = os.environ.get("DATA_DIR", "/tmp")
 os.makedirs(DATA_DIR, exist_ok=True)
+
+# ── Redis connection ───────────────────────────────────────────────────────────
+_redis_client = None
+_REDIS_PREFIX  = "statham:"
+
+def _get_redis():
+    """Возвращает Redis-клиент или None если Redis недоступен."""
+    global _redis_client
+    if not _REDIS_AVAILABLE:
+        return None
+    if _redis_client is not None:
+        return _redis_client
+    url = os.environ.get("REDIS_URL", "").strip()
+    if not url:
+        return None
+    try:
+        client = _redis_lib.from_url(
+            url, decode_responses=True,
+            socket_timeout=5, socket_connect_timeout=5,
+        )
+        client.ping()
+        _redis_client = client
+        log.info("Redis | connected OK")
+    except Exception as e:
+        log.warning(f"Redis | connect failed: {e}")
+    return _redis_client
+
+def _rkey(path: str) -> str:
+    """Преобразует путь к файлу в ключ Redis: /tmp/active_trades.json → statham:active_trades"""
+    return _REDIS_PREFIX + os.path.basename(path).replace(".json", "")
 
 STATS_FILE      = os.path.join(DATA_DIR, "trade_stats.json")
 TRADES_FILE     = os.path.join(DATA_DIR, "active_trades.json")
@@ -209,6 +246,16 @@ _file_lock = threading.Lock()
 
 
 def load_json(path: str, default):
+    # 1) Пробуем Redis
+    r = _get_redis()
+    if r is not None:
+        try:
+            val = r.get(_rkey(path))
+            if val is not None:
+                return json.loads(val)
+        except Exception as e:
+            log.warning(f"REDIS_LOAD_ERR | {_rkey(path)} | {e}")
+    # 2) Фолбэк: файл
     if not os.path.exists(path):
         return default
     try:
@@ -221,11 +268,21 @@ def load_json(path: str, default):
 
 
 def save_json(path: str, data):
+    serialized = json.dumps(data, ensure_ascii=False)
+    # 1) Сохраняем в Redis
+    r = _get_redis()
+    if r is not None:
+        try:
+            r.set(_rkey(path), serialized)
+            return  # Redis OK — файл не нужен
+        except Exception as e:
+            log.warning(f"REDIS_SAVE_ERR | {_rkey(path)} | {e}")
+    # 2) Фолбэк: файл (атомарная запись)
     try:
         tmp = path + ".tmp"
         with _file_lock:
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.write(serialized)
             os.replace(tmp, path)
     except Exception as e:
         write_log(f"SAVE_JSON_ERR | {path} | {e}")
@@ -1795,6 +1852,20 @@ def test_bingx_route():
     if not BINGX_AVAILABLE:
         return jsonify({"error": "BingX не настроен"}), 400
     return jsonify({"result": get_bingx_balance()})
+
+
+@app.route("/redis_status")
+def redis_status_route():
+    r = _get_redis()
+    if r is None:
+        return jsonify({"redis": "not configured", "REDIS_URL_set": bool(os.environ.get("REDIS_URL"))}), 200
+    try:
+        r.ping()
+        keys = r.keys(_REDIS_PREFIX + "*")
+        sizes = {k: len(r.get(k) or "") for k in keys}
+        return jsonify({"redis": "ok", "keys": sizes})
+    except Exception as e:
+        return jsonify({"redis": "error", "detail": str(e)}), 200
 
 
 # ══════════════════════════════════════════════════════════════════════════════
