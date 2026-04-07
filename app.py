@@ -740,6 +740,10 @@ def parse_price(text: str, *prefixes: str):
     return None
 
 
+def infer_entry_price(text: str):
+    return parse_price(text, "🎯 Вход:", "⚡ Вход:", "💰 Цена:", "Цена:")
+
+
 def pos_key(ticker: str, direction: str) -> str:
     return f"{ticker}_{direction}"
 
@@ -865,6 +869,11 @@ def save_trade_to_history(payload: dict, trade_data: dict | None, result: str, t
             or trade_data.get("exchange")
             or pos.get("exchange")
             or ""
+        ),
+        "trade_mode": (
+            trade_data.get("trade_mode")
+            or pos.get("trade_mode")
+            or ("telegram_only" if (payload.get("exchange") or pos.get("exchange")) == "none" else "trade")
         ),
         "is_strong": bool(
             payload.get("is_strong", trade_data.get("is_strong", pos.get("is_strong", False)))
@@ -1071,6 +1080,7 @@ def handle_entry(payload: dict):
     exchange = get_exchange_for(ticker)
     key = build_trade_key(payload)
     pkey = pos_key(ticker, direction)
+    trade_mode = "trade" if exchange != "none" else "telegram_only"
 
     with _pos_lock:
         existing_pos = load_positions().get(pkey)
@@ -1080,10 +1090,6 @@ def handle_entry(payload: dict):
 
     source_msg = send_signals(text or f"📥 Вход {ticker} {direction}")
     source_msg_id = source_msg.get("message_id")
-    if exchange == "none":
-        write_log(f"ENTRY_SKIP | {ticker} | no active exchange")
-        send_signals(f"⚠️ <b>Сделка {ticker} пропущена</b>\nБиржа для тикера не настроена.", reply_to=source_msg_id)
-        return
 
     side = "Buy" if direction == "BUY" else "Sell"
     opp_side = "Sell" if side == "Buy" else "Buy"
@@ -1103,44 +1109,51 @@ def handle_entry(payload: dict):
     tp2_price = parse_price(text, "TP2:", "✅ TP2:")
     tp3_price = parse_price(text, "TP3:", "✅ TP3:")
     tp4_price = parse_price(text, "TP4:", "✅ TP4:")
-
-    ex_set_leverage(ticker, leverage, exchange)
-
-    try:
-        price = ex_get_price(ticker, exchange)
-    except Exception as e:
-        write_log(f"ENTRY_ERR | get_price | {ticker} ({exchange}) | {e}")
-        send_signals(
-            f"❌ <b>Ошибка входа {ticker}</b>\nЦена недоступна ({exchange}): {e}",
-            reply_to=source_msg_id,
-        )
-        return
-
-    qty = ex_calc_qty(ticker, size_usdt, leverage, price, exchange)
-    write_log(f"ENTRY | {ticker} {direction} [{exchange}] price={price} qty={qty} lev={leverage}x")
-
-    try:
-        ex_place_market(ticker, side, qty, False, exchange)
-    except Exception as e:
-        write_log(f"ENTRY_FAIL | {ticker} ({exchange}) | {e}")
-        send_signals(
-            f"❌ <b>Ошибка входа {ticker} {direction}</b> [{exchange}]\n{e}",
-            reply_to=source_msg_id,
-        )
-        return
-
-    time.sleep(0.5)
-
+    price = infer_entry_price(text)
+    qty = 1.0
     sl_order_id = ""
-    if sl_price:
+
+    if trade_mode == "trade":
+        ex_set_leverage(ticker, leverage, exchange)
+
         try:
-            resp = ex_place_stop(ticker, opp_side, qty, sl_price, exchange)
-            if exchange == "bybit" and resp.get("retCode") == 0:
-                sl_order_id = resp["result"].get("orderId", "")
-            elif exchange == "bingx":
-                sl_order_id = resp.get("data", {}).get("orderId", "") or "ok"
+            price = ex_get_price(ticker, exchange)
         except Exception as e:
-            write_log(f"SL_PLACE_ERR | {ticker} ({exchange}) | {e}")
+            write_log(f"ENTRY_ERR | get_price | {ticker} ({exchange}) | {e}")
+            send_signals(
+                f"❌ <b>Ошибка входа {ticker}</b>\nЦена недоступна ({exchange}): {e}",
+                reply_to=source_msg_id,
+            )
+            return
+
+        qty = ex_calc_qty(ticker, size_usdt, leverage, price, exchange)
+        write_log(f"ENTRY | {ticker} {direction} [{exchange}] price={price} qty={qty} lev={leverage}x")
+
+        try:
+            ex_place_market(ticker, side, qty, False, exchange)
+        except Exception as e:
+            write_log(f"ENTRY_FAIL | {ticker} ({exchange}) | {e}")
+            send_signals(
+                f"❌ <b>Ошибка входа {ticker} {direction}</b> [{exchange}]\n{e}",
+                reply_to=source_msg_id,
+            )
+            return
+
+        time.sleep(0.5)
+
+        if sl_price:
+            try:
+                resp = ex_place_stop(ticker, opp_side, qty, sl_price, exchange)
+                if exchange == "bybit" and resp.get("retCode") == 0:
+                    sl_order_id = resp["result"].get("orderId", "")
+                elif exchange == "bingx":
+                    sl_order_id = resp.get("data", {}).get("orderId", "") or "ok"
+            except Exception as e:
+                write_log(f"SL_PLACE_ERR | {ticker} ({exchange}) | {e}")
+    else:
+        write_log(f"ENTRY_TELEGRAM_ONLY | {ticker} {direction} | no exchange execution")
+        if price is None:
+            price = 0.0
 
     created_at = int(time.time())
     instance_id = _trade_instance_id(key, {
@@ -1150,17 +1163,19 @@ def handle_entry(payload: dict):
         "timeframe": timeframe,
         "created_at": created_at,
     })
-    entry_message = send_signals(
-        f"{'🟢' if direction == 'BUY' else '🔴'} <b>{'LONG' if direction=='BUY' else 'SHORT'} ОТКРЫТ</b>  "
-        f"[{'Bybit' if exchange == 'bybit' else 'BingX'}] "
-        f"{('🧪 TEST' if TESTNET else '🔴 LIVE') if exchange == 'bybit' else ('🧪 DEMO' if BINGX_DEMO else '🔴 LIVE')}\n"
-        f"#{ticker}  |  {leverage}x  |  {size_usdt} USDT\n"
-        f"📍 Вход: <b>{price}</b>  |  ⛔ SL: {sl_price or '—'}\n"
-        f"✅ TP1: {tp1_price or '—'}  |  TP2: {tp2_price or '—'}\n"
-        f"📦 Объём: {qty} контр.",
-        reply_to=source_msg_id,
-    )
-    trade_message_id = entry_message.get("message_id") or source_msg_id
+    trade_message_id = source_msg_id
+    if trade_mode == "trade":
+        entry_message = send_signals(
+            f"{'🟢' if direction == 'BUY' else '🔴'} <b>{'LONG' if direction=='BUY' else 'SHORT'} ОТКРЫТ</b>  "
+            f"[{'Bybit' if exchange == 'bybit' else 'BingX'}] "
+            f"{('🧪 TEST' if TESTNET else '🔴 LIVE') if exchange == 'bybit' else ('🧪 DEMO' if BINGX_DEMO else '🔴 LIVE')}\n"
+            f"#{ticker}  |  {leverage}x  |  {size_usdt} USDT\n"
+            f"📍 Вход: <b>{price}</b>  |  ⛔ SL: {sl_price or '—'}\n"
+            f"✅ TP1: {tp1_price or '—'}  |  TP2: {tp2_price or '—'}\n"
+            f"📦 Объём: {qty} контр.",
+            reply_to=source_msg_id,
+        )
+        trade_message_id = entry_message.get("message_id") or source_msg_id
 
     trade_record = {
         "message_id": trade_message_id,
@@ -1172,6 +1187,7 @@ def handle_entry(payload: dict):
         "direction": direction,
         "timeframe": timeframe,
         "exchange": exchange,
+        "trade_mode": trade_mode,
         "trade_id": trade_id,
         "trade_key": key,
         "instance_id": instance_id,
@@ -1196,6 +1212,7 @@ def handle_entry(payload: dict):
             "side": side,
             "opp_side": opp_side,
             "exchange": exchange,
+            "trade_mode": trade_mode,
             "entry_price": price,
             "total_qty": qty,
             "remaining_qty": qty,
@@ -1256,16 +1273,19 @@ def handle_tp_hit(payload: dict):
         opp_side = pos["opp_side"]
         close_qty = round(total_qty * TP_CLOSE_PCT.get(tp_num, 0.0), 8)
         close_qty = min(close_qty, remaining)
+        min_q = ex_min_qty(ticker, exchange) if exchange != "none" else 0.0
 
-        min_q = ex_min_qty(ticker, exchange)
-        if close_qty < min_q:
-            return
+        if exchange != "none":
+            if close_qty < min_q:
+                return
 
-        try:
-            ex_place_market(ticker, opp_side, close_qty, True, exchange)
-        except Exception as e:
-            write_log(f"TP_HIT_ERR | {ticker} TP{tp_num} ({exchange}) | {e}")
-            return
+            try:
+                ex_place_market(ticker, opp_side, close_qty, True, exchange)
+            except Exception as e:
+                write_log(f"TP_HIT_ERR | {ticker} TP{tp_num} ({exchange}) | {e}")
+                return
+        elif close_qty <= 0:
+            close_qty = 0.0
 
         new_remaining = max(0.0, remaining - close_qty)
         pos[f"tp{tp_num}_hit"] = True
@@ -1273,7 +1293,9 @@ def handle_tp_hit(payload: dict):
         highest_tp = _highest_tp_hit(pos)
 
         if tp_num == 2 and pos.get("tp1_price"):
-            oid = move_sl(pos, pos["tp1_price"])
+            oid = ""
+            if exchange != "none":
+                oid = move_sl(pos, pos["tp1_price"])
             pos["sl_price"] = pos["tp1_price"]
             pos["sl_order_id"] = oid
 
@@ -1281,8 +1303,9 @@ def handle_tp_hit(payload: dict):
             pos["trail_active"] = True
             pos["trail_sl"]     = pos.get("sl_price")
 
-        if new_remaining < min_q or tp_num >= 6:
-            ex_cancel_all(ticker, exchange)
+        if new_remaining <= min_q or tp_num >= 6:
+            if exchange != "none":
+                ex_cancel_all(ticker, exchange)
             positions.pop(pkey, None)
             final_close = True
         else:
@@ -1328,7 +1351,8 @@ def handle_sl_hit(payload: dict):
         exchange = pos.get("exchange", "bybit")
         highest_tp = _highest_tp_hit(pos)
         pos_snapshot = dict(pos)
-        ex_cancel_all(ticker, exchange)
+        if exchange != "none":
+            ex_cancel_all(ticker, exchange)
         positions.pop(pkey, None)
         save_positions(positions)
     reply_id = (trade or {}).get("message_id") or pos_snapshot.get("message_id")
@@ -1361,7 +1385,9 @@ def handle_sl_moved(payload: dict):
             return
         reply_id = (trade or {}).get("message_id") or pos.get("message_id")
         send_signals(text or f"🔒 SL сдвинут {ticker}", reply_to=reply_id)
-        oid = move_sl(pos, new_sl)
+        oid = ""
+        if pos.get("exchange", "bybit") != "none":
+            oid = move_sl(pos, new_sl)
         pos["sl_price"]    = new_sl
         pos["sl_order_id"] = oid
         positions[pkey] = pos
@@ -1383,8 +1409,9 @@ def close_position_manually(pos: dict, source: str) -> tuple[bool, str]:
     )
     if remaining > 0:
         try:
-            ex_cancel_all(ticker, exchange)
-            ex_place_market(ticker, pos["opp_side"], remaining, True, exchange)
+            if exchange != "none":
+                ex_cancel_all(ticker, exchange)
+                ex_place_market(ticker, pos["opp_side"], remaining, True, exchange)
         except Exception as e:
             write_log(f"MANUAL_CLOSE_ERR | {ticker} | {e}")
             return False, f"{ticker}[{exchange}]"
@@ -2046,13 +2073,12 @@ def bybit_webhook():
 
     # Проверка WEBHOOK_SECRET отключена — принимаем все POST запросы
 
-    # Ранняя фильтрация по тикеру
+    # Все алерты принимаем: торговые пары торгуются, остальные идут только в Telegram.
     ticker = payload.get("ticker", "").upper().replace(".P", "")
     event  = payload.get("event", "")
     if event in ("entry", "smart_entry", "limit_hit") and ticker:
         if ALLOWED_PAIRS and ticker not in ALLOWED_PAIRS:
-            write_log(f"WEBHOOK_SKIP | {ticker} not in ALLOWED_PAIRS")
-            return jsonify({"status": "skipped", "reason": "ticker not allowed"}), 200
+            write_log(f"WEBHOOK_TELEGRAM_ONLY | {ticker} not in ALLOWED_PAIRS")
 
     write_log(f"WEBHOOK | event={payload.get('event','?')} ticker={payload.get('ticker','?')}")
     enqueue_signal(payload)
