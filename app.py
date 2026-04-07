@@ -165,6 +165,7 @@ HISTORY_FILE    = os.path.join(DATA_DIR, "trade_history.json")
 POSITIONS_FILE  = os.path.join(DATA_DIR, "positions.json")
 FG_STATE_FILE   = os.path.join(DATA_DIR, "fg_state.json")
 SENT_FLAGS_FILE = os.path.join(DATA_DIR, "sent_flags.json")
+CLOSED_TRADES_FILE = os.path.join(DATA_DIR, "closed_trades.json")
 LOG_FILE        = os.path.join(DATA_DIR, "bot.log")
 
 MAX_QUEUE_ATTEMPTS = 3
@@ -173,7 +174,10 @@ _signal_queue: list[dict] = []
 _queue_lock   = threading.Lock()
 _pos_lock     = threading.Lock()
 _bybit_lock   = threading.Lock()
+_state_lock   = threading.RLock()
+_bg_lock      = threading.Lock()
 _emergency_stop = threading.Event()
+_bg_started   = False
 
 FG_SCHEDULED_HOURS = {4, 10, 16, 22}
 
@@ -274,7 +278,6 @@ def save_json(path: str, data):
     if r is not None:
         try:
             r.set(_rkey(path), serialized)
-            return  # Redis OK — файл не нужен
         except Exception as e:
             log.warning(f"REDIS_SAVE_ERR | {_rkey(path)} | {e}")
     # 2) Фолбэк: файл (атомарная запись)
@@ -298,14 +301,24 @@ def save_history(d)  : save_json(HISTORY_FILE,  d)
 def save_positions(d): save_json(POSITIONS_FILE, d)
 
 
+def load_closed_trades() -> dict:
+    return load_json(CLOSED_TRADES_FILE, {})
+
+
+def save_closed_trades(d: dict):
+    save_json(CLOSED_TRADES_FILE, d)
+
+
 def _was_sent(key: str) -> bool:
-    return load_json(SENT_FLAGS_FILE, {}).get(key, False)
+    with _state_lock:
+        return load_json(SENT_FLAGS_FILE, {}).get(key, False)
 
 
 def _mark_sent(key: str):
-    flags = load_json(SENT_FLAGS_FILE, {})
-    flags[key] = True
-    save_json(SENT_FLAGS_FILE, flags)
+    with _state_lock:
+        flags = load_json(SENT_FLAGS_FILE, {})
+        flags[key] = True
+        save_json(SENT_FLAGS_FILE, flags)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -754,52 +767,175 @@ def move_sl(pos: dict, new_sl: float) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 # СТАТИСТИКА И ИСТОРИЯ
 # ══════════════════════════════════════════════════════════════════════════════
+def _trade_instance_id(key: str = "", trade_data: dict | None = None,
+                       pos: dict | None = None, payload: dict | None = None) -> str:
+    for source in (trade_data, pos):
+        if source and source.get("instance_id"):
+            return str(source["instance_id"])
+
+    created_at = 0
+    for source in (trade_data, pos):
+        if source and source.get("created_at"):
+            created_at = int(source["created_at"])
+            break
+
+    trade_id = ""
+    for source in (trade_data, pos, payload or {}):
+        if source and source.get("trade_id"):
+            trade_id = str(source["trade_id"]).strip()
+            break
+
+    ticker = ""
+    direction = ""
+    timeframe = ""
+    for source in (trade_data, pos, payload or {}):
+        if source:
+            ticker = ticker or str(source.get("ticker") or source.get("symbol") or "").strip()
+            direction = direction or str(source.get("direction") or "").strip()
+            timeframe = timeframe or str(source.get("timeframe") or "").strip()
+
+    base = trade_id or key or "_".join(x for x in (ticker, direction, timeframe) if x)
+    if not base:
+        base = "trade"
+    if not created_at:
+        created_at = int(time.time())
+    return f"{base}:{created_at}"
+
+
+def _highest_tp_hit(pos: dict | None) -> int:
+    if not pos:
+        return 0
+    hits = [n for n in range(1, 7) if pos.get(f"tp{n}_hit")]
+    return max(hits, default=0)
+
+
 def update_stats(is_win: bool):
-    s = load_stats()
-    s["total"]  = s.get("total", 0) + 1
-    if is_win:  s["wins"]   = s.get("wins",   0) + 1
-    else:       s["losses"] = s.get("losses", 0) + 1
-    save_stats(s)
+    with _state_lock:
+        s = load_stats()
+        s["total"] = s.get("total", 0) + 1
+        if is_win:
+            s["wins"] = s.get("wins", 0) + 1
+        else:
+            s["losses"] = s.get("losses", 0) + 1
+        save_stats(s)
 
 
-def save_trade_to_history(payload: dict, trade_data: dict | None, result: str, tp_num: int):
-    now        = int(time.time())
-    entry_time = trade_data.get("created_at", now) if trade_data else now
+def save_trade_to_history(payload: dict, trade_data: dict | None, result: str, tp_num: int,
+                          close_reason: str = "", pos: dict | None = None):
+    trade_data = trade_data or {}
+    pos = pos or {}
+    now = int(time.time())
+    entry_time = (
+        trade_data.get("created_at")
+        or pos.get("created_at")
+        or now
+    )
+    trade_key = (
+        trade_data.get("trade_key")
+        or pos.get("trade_key")
+        or build_trade_key(payload)
+    )
+    instance_id = _trade_instance_id(trade_key, trade_data, pos, payload)
     record = {
-        "trade_id":     payload.get("trade_id", ""),
-        "ticker":       payload.get("ticker", ""),
-        "direction":    payload.get("direction", ""),
-        "timeframe":    payload.get("timeframe", ""),
-        "exchange":     payload.get("exchange", ""),
-        "is_strong":    payload.get("is_strong", False),
-        "entry_time":   entry_time,
-        "close_time":   now,
+        "instance_id": instance_id,
+        "trade_key": trade_key,
+        "trade_id": (
+            str(payload.get("trade_id") or trade_data.get("trade_id") or pos.get("trade_id") or "")
+        ),
+        "ticker": (
+            payload.get("ticker")
+            or trade_data.get("ticker")
+            or pos.get("symbol")
+            or ""
+        ),
+        "direction": (
+            payload.get("direction")
+            or trade_data.get("direction")
+            or pos.get("direction")
+            or ""
+        ),
+        "timeframe": (
+            payload.get("timeframe")
+            or trade_data.get("timeframe")
+            or pos.get("timeframe")
+            or ""
+        ),
+        "exchange": (
+            payload.get("exchange")
+            or trade_data.get("exchange")
+            or pos.get("exchange")
+            or ""
+        ),
+        "is_strong": bool(
+            payload.get("is_strong", trade_data.get("is_strong", pos.get("is_strong", False)))
+        ),
+        "entry_message_id": trade_data.get("message_id") or pos.get("message_id"),
+        "signal_message_id": trade_data.get("signal_message_id") or pos.get("signal_message_id"),
+        "entry_price": trade_data.get("entry_price") or pos.get("entry_price"),
+        "sl_price": pos.get("sl_price", trade_data.get("sl_price")),
+        "total_qty": pos.get("total_qty", trade_data.get("total_qty")),
+        "remaining_qty": pos.get("remaining_qty", trade_data.get("remaining_qty")),
+        "highest_tp_hit": max(tp_num, _highest_tp_hit(pos)),
+        "entry_time": entry_time,
+        "close_time": now,
         "duration_sec": max(0, now - entry_time),
-        "result":       result,
-        "tp_num":       tp_num,
-        "date_msk":     _msk().strftime("%Y-%m-%d"),
-        "week_msk":     f"{_msk().year}-W{_msk().isocalendar()[1]:02d}",
+        "result": result,
+        "tp_num": tp_num,
+        "close_reason": close_reason or payload.get("event", ""),
+        "date_msk": _msk().strftime("%Y-%m-%d"),
+        "week_msk": f"{_msk().year}-W{_msk().isocalendar()[1]:02d}",
     }
-    history = load_history()
-    history.append(record)
-    if len(history) > 2000:
-        history = history[-2000:]
-    save_history(history)
+    with _state_lock:
+        history = load_history()
+        history.append(record)
+        if len(history) > 5000:
+            history = history[-5000:]
+        save_history(history)
+
+
+def _trade_already_closed(instance_id: str) -> bool:
+    if not instance_id:
+        return False
+    with _state_lock:
+        return instance_id in load_closed_trades()
+
+
+def _mark_trade_closed(instance_id: str, result: str, close_reason: str) -> bool:
+    if not instance_id:
+        return True
+    with _state_lock:
+        closed = load_closed_trades()
+        if instance_id in closed:
+            return False
+        closed[instance_id] = {
+            "closed_at": int(time.time()),
+            "result": result,
+            "close_reason": close_reason,
+        }
+        if len(closed) > 5000:
+            closed = dict(list(closed.items())[-5000:])
+        save_closed_trades(closed)
+        return True
 
 
 def _build_report(trades: list, title: str) -> str:
-    wins    = [r for r in trades if r["result"] == "win"]
-    losses  = [r for r in trades if r["result"] == "loss"]
-    total   = len(trades)
-    wr      = calc_winrate(len(wins), total)
+    wins = [r for r in trades if r["result"] == "win"]
+    losses = [r for r in trades if r["result"] == "loss"]
+    manuals = [r for r in trades if r["result"] == "manual"]
+    scored_total = len(wins) + len(losses)
+    total = len(trades)
+    wr = calc_winrate(len(wins), scored_total)
     avg_dur = int(sum(r.get("duration_sec", 0) for r in trades) / total) if total else 0
     tp_counts: dict = {}
     for r in wins:
-        k = f"TP{r['tp_num']}"; tp_counts[k] = tp_counts.get(k, 0) + 1
-    text  = f"{title}\n\n"
+        k = f"TP{r['tp_num']}"
+        tp_counts[k] = tp_counts.get(k, 0) + 1
+    text = f"{title}\n\n"
     text += f"📊 Win Rate: <b>{wr}%</b>\n"
     text += f"✅ TP: {len(wins)}   ❌ SL: {len(losses)}\n"
     text += f"📈 Всего закрыто: {total}\n"
+    if manuals:
+        text += f"🧯 Manual close: {len(manuals)}\n"
     text += f"⏱ Ср. время: {fmt_duration(avg_dur)}\n"
     if tp_counts:
         text += "\n<b>Разбивка по TP:</b>\n"
@@ -821,86 +957,135 @@ def build_trade_key(payload: dict) -> str:
     return f"{ticker}_{direction}_{tf}" if ticker else ""
 
 
+def find_trade_entry(key: str = "", trade_id: str = "", ticker: str = "",
+                     direction: str = "") -> tuple[str | None, dict | None]:
+    ticker = ticker.upper().replace(".P", "") if ticker else ""
+    direction = direction.upper() if direction else ""
+    trade_id = str(trade_id or "").strip()
+    with _state_lock:
+        trades = load_trades()
+        if key and key in trades:
+            return key, trades[key]
+        if trade_id and trade_id in trades:
+            return trade_id, trades[trade_id]
+        if key and "_" in key:
+            parts = key.split("_")
+            if len(parts) >= 2:
+                ticker = ticker or parts[0]
+                direction = direction or parts[1]
+        if ticker and direction:
+            for stored_key, trade in trades.items():
+                if trade.get("ticker", "") == ticker and trade.get("direction", "") == direction:
+                    return stored_key, trade
+    return None, None
+
+
 def put_trade(key: str, data: dict):
-    t = load_trades(); t[key] = data; save_trades(t)
+    with _state_lock:
+        t = load_trades()
+        t[key] = data
+        save_trades(t)
 
 
 def get_trade(key: str) -> dict | None:
-    trades = load_trades()
-    if key in trades:
-        return trades[key]
-    if key and "_" in key:
-        parts = key.split("_")
-        if len(parts) >= 2:
-            tk, dr = parts[0], parts[1]
-            for k, v in trades.items():
-                if v.get("ticker","") == tk and v.get("direction","") == dr:
-                    return v
-    return None
+    _, trade = find_trade_entry(key=key)
+    return trade
+
+
+def touch_trade(key: str | None, **fields):
+    if not key:
+        return
+    with _state_lock:
+        trades = load_trades()
+        trade = trades.get(key)
+        if not trade:
+            return
+        trade.update(fields)
+        trades[key] = trade
+        save_trades(trades)
 
 
 def remove_trade(key: str):
-    t = load_trades()
-    if key in t:
-        del t[key]; save_trades(t)
+    if not key:
+        return
+    with _state_lock:
+        t = load_trades()
+        if key in t:
+            del t[key]
+            save_trades(t)
 
 
 def dedup_entry(ticker: str, direction: str):
-    trades = load_trades()
-    keys_to_remove = [
-        k for k, v in trades.items()
-        if v.get("ticker","") == ticker and v.get("direction","") == direction
-    ]
-    for k in keys_to_remove:
-        del trades[k]
-    if keys_to_remove:
-        save_trades(trades)
-        write_log(f"DEDUP | removed {len(keys_to_remove)} old keys for {ticker}_{direction}")
+    with _state_lock:
+        trades = load_trades()
+        keys_to_remove = [
+            k for k, v in trades.items()
+            if v.get("ticker", "") == ticker and v.get("direction", "") == direction
+        ]
+        for k in keys_to_remove:
+            del trades[k]
+        if keys_to_remove:
+            save_trades(trades)
+            write_log(f"DEDUP | removed {len(keys_to_remove)} old keys for {ticker}_{direction}")
 
 
 def cleanup_old_trades() -> int:
-    trades  = load_trades()
-    cutoff  = int(time.time()) - 7 * 86400
-    removed = [k for k, v in trades.items() if v.get("created_at", 0) < cutoff]
-    for k in removed:
-        del trades[k]
-    if removed:
-        save_trades(trades)
-    return len(removed)
+    with _state_lock:
+        trades = load_trades()
+        cutoff = int(time.time()) - 7 * 86400
+        removed = [k for k, v in trades.items() if v.get("created_at", 0) < cutoff]
+        for k in removed:
+            del trades[k]
+        if removed:
+            save_trades(trades)
+        return len(removed)
+
+
+def finalize_trade(payload: dict, trade_key: str | None, trade_data: dict | None,
+                   pos: dict | None, result: str, tp_num: int,
+                   close_reason: str) -> bool:
+    trade_data = trade_data or {}
+    pos = pos or {}
+    actual_key = trade_key or trade_data.get("trade_key") or pos.get("trade_key") or build_trade_key(payload)
+    instance_id = _trade_instance_id(actual_key, trade_data, pos, payload)
+    if not _mark_trade_closed(instance_id, result, close_reason):
+        write_log(f"FINALIZE_SKIP | {instance_id} already closed")
+        return False
+    if result in ("win", "loss"):
+        update_stats(result == "win")
+    save_trade_to_history(payload, trade_data, result, tp_num, close_reason=close_reason, pos=pos)
+    if actual_key:
+        remove_trade(actual_key)
+    return True
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ОБРАБОТЧИКИ СИГНАЛОВ
 # ══════════════════════════════════════════════════════════════════════════════
 def handle_entry(payload: dict):
-    ticker    = payload.get("ticker", "").upper().replace(".P", "")
+    ticker = payload.get("ticker", "").upper().replace(".P", "")
     direction = payload.get("direction", "").upper()
-    text      = payload.get("text", "").strip()
-    trade_id  = str(payload.get("trade_id") or "")
-    exchange  = get_exchange_for(ticker)
+    text = payload.get("text", "").strip()
+    trade_id = str(payload.get("trade_id") or "")
+    timeframe = payload.get("timeframe", "")
+    exchange = get_exchange_for(ticker)
+    key = build_trade_key(payload)
+    pkey = pos_key(ticker, direction)
 
-    dedup_entry(ticker, direction)
-    key  = build_trade_key(payload)
-    sent = send_signals(text or f"📥 Вход {ticker} {direction}")
-    if key:
-        put_trade(key, {
-            "message_id": sent.get("message_id"),
-            "chat_id":    TG_CHAT,
-            "thread_id":  int(TG_SIGNALS_TOPIC),
-            "event":      "entry",
-            "ticker":     ticker,
-            "direction":  direction,
-            "timeframe":  payload.get("timeframe", ""),
-            "exchange":   exchange,
-            "is_strong":  payload.get("is_strong", False),
-            "created_at": int(time.time()),
-        })
-
-    if exchange == "none":
-        write_log(f"ENTRY_SKIP | {ticker} | no active exchange")
+    with _pos_lock:
+        existing_pos = load_positions().get(pkey)
+    if existing_pos:
+        write_log(f"ENTRY_DUPLICATE_SKIP | {ticker} {direction} | active position exists")
         return
 
-    side     = "Buy"  if direction == "BUY"  else "Sell"
+    source_msg = send_signals(text or f"📥 Вход {ticker} {direction}")
+    source_msg_id = source_msg.get("message_id")
+    if exchange == "none":
+        write_log(f"ENTRY_SKIP | {ticker} | no active exchange")
+        send_signals(f"⚠️ <b>Сделка {ticker} пропущена</b>\nБиржа для тикера не настроена.", reply_to=source_msg_id)
+        return
+
+    side = "Buy" if direction == "BUY" else "Sell"
     opp_side = "Sell" if side == "Buy" else "Buy"
 
     # Дефолты по бирже: Bybit = 10x / 1 USDT, BingX = 20x / 30 USDT
@@ -908,8 +1093,8 @@ def handle_entry(payload: dict):
         "bybit": {"leverage": 10,  "size_usdt": 1.0},
         "bingx": {"leverage": 20,  "size_usdt": 30.0},
     }
-    ex_def   = exchange_defaults.get(exchange, {"leverage": DEFAULT_LEVERAGE, "size_usdt": DEFAULT_SIZE_USDT})
-    cfg      = {**ex_def, **PAIR_SETTINGS.get(ticker, {})}
+    ex_def = exchange_defaults.get(exchange, {"leverage": DEFAULT_LEVERAGE, "size_usdt": DEFAULT_SIZE_USDT})
+    cfg = {**ex_def, **PAIR_SETTINGS.get(ticker, {})}
     leverage  = int(cfg["leverage"])
     size_usdt = float(cfg["size_usdt"])
 
@@ -925,7 +1110,10 @@ def handle_entry(payload: dict):
         price = ex_get_price(ticker, exchange)
     except Exception as e:
         write_log(f"ENTRY_ERR | get_price | {ticker} ({exchange}) | {e}")
-        send_signals(f"❌ <b>Ошибка входа {ticker}</b>\nЦена недоступна ({exchange}): {e}")
+        send_signals(
+            f"❌ <b>Ошибка входа {ticker}</b>\nЦена недоступна ({exchange}): {e}",
+            reply_to=source_msg_id,
+        )
         return
 
     qty = ex_calc_qty(ticker, size_usdt, leverage, price, exchange)
@@ -935,7 +1123,10 @@ def handle_entry(payload: dict):
         ex_place_market(ticker, side, qty, False, exchange)
     except Exception as e:
         write_log(f"ENTRY_FAIL | {ticker} ({exchange}) | {e}")
-        send_signals(f"❌ <b>Ошибка входа {ticker} {direction}</b> [{exchange}]\n{e}")
+        send_signals(
+            f"❌ <b>Ошибка входа {ticker} {direction}</b> [{exchange}]\n{e}",
+            reply_to=source_msg_id,
+        )
         return
 
     time.sleep(0.5)
@@ -951,73 +1142,118 @@ def handle_entry(payload: dict):
         except Exception as e:
             write_log(f"SL_PLACE_ERR | {ticker} ({exchange}) | {e}")
 
+    created_at = int(time.time())
+    instance_id = _trade_instance_id(key, {
+        "trade_id": trade_id,
+        "ticker": ticker,
+        "direction": direction,
+        "timeframe": timeframe,
+        "created_at": created_at,
+    })
+    entry_message = send_signals(
+        f"{'🟢' if direction == 'BUY' else '🔴'} <b>{'LONG' if direction=='BUY' else 'SHORT'} ОТКРЫТ</b>  "
+        f"[{'Bybit' if exchange == 'bybit' else 'BingX'}] "
+        f"{('🧪 TEST' if TESTNET else '🔴 LIVE') if exchange == 'bybit' else ('🧪 DEMO' if BINGX_DEMO else '🔴 LIVE')}\n"
+        f"#{ticker}  |  {leverage}x  |  {size_usdt} USDT\n"
+        f"📍 Вход: <b>{price}</b>  |  ⛔ SL: {sl_price or '—'}\n"
+        f"✅ TP1: {tp1_price or '—'}  |  TP2: {tp2_price or '—'}\n"
+        f"📦 Объём: {qty} контр.",
+        reply_to=source_msg_id,
+    )
+    trade_message_id = entry_message.get("message_id") or source_msg_id
+
+    trade_record = {
+        "message_id": trade_message_id,
+        "signal_message_id": source_msg_id,
+        "chat_id": TG_CHAT,
+        "thread_id": int(TG_SIGNALS_TOPIC),
+        "event": "entry",
+        "ticker": ticker,
+        "direction": direction,
+        "timeframe": timeframe,
+        "exchange": exchange,
+        "trade_id": trade_id,
+        "trade_key": key,
+        "instance_id": instance_id,
+        "is_strong": payload.get("is_strong", False),
+        "created_at": created_at,
+        "entry_price": price,
+        "total_qty": qty,
+        "remaining_qty": qty,
+        "sl_price": sl_price,
+    }
+    dedup_entry(ticker, direction)
+    if key:
+        put_trade(key, trade_record)
+
     pkey = pos_key(ticker, direction)
     with _pos_lock:
         positions = load_positions()
         positions[pkey] = {
-            "symbol":        ticker,
-            "direction":     direction,
-            "side":          side,
-            "opp_side":      opp_side,
-            "exchange":      exchange,
-            "entry_price":   price,
-            "total_qty":     qty,
+            "symbol": ticker,
+            "ticker": ticker,
+            "direction": direction,
+            "side": side,
+            "opp_side": opp_side,
+            "exchange": exchange,
+            "entry_price": price,
+            "total_qty": qty,
             "remaining_qty": qty,
-            "leverage":      leverage,
-            "sl_price":      sl_price,
-            "sl_order_id":   sl_order_id,
-            "tp1_price":     tp1_price,
-            "tp2_price":     tp2_price,
-            "tp3_price":     tp3_price,
-            "tp4_price":     tp4_price,
-            "trade_id":      trade_id,
-            "created_at":    int(time.time()),
-            "trail_active":  False,
-            "trail_sl":      None,
+            "leverage": leverage,
+            "sl_price": sl_price,
+            "sl_order_id": sl_order_id,
+            "tp1_price": tp1_price,
+            "tp2_price": tp2_price,
+            "tp3_price": tp3_price,
+            "tp4_price": tp4_price,
+            "trade_id": trade_id,
+            "trade_key": key,
+            "instance_id": instance_id,
+            "timeframe": timeframe,
+            "is_strong": payload.get("is_strong", False),
+            "message_id": trade_message_id,
+            "signal_message_id": source_msg_id,
+            "created_at": created_at,
+            "trail_active": False,
+            "trail_sl": None,
         }
         save_positions(positions)
 
-    exch_tag = "Bybit" if exchange == "bybit" else "BingX"
-    net_tag  = ("🧪 TEST" if TESTNET else "🔴 LIVE") if exchange == "bybit" \
-               else ("🧪 DEMO" if BINGX_DEMO else "🔴 LIVE")
-    arrow    = "🟢" if direction == "BUY" else "🔴"
-    send_signals(
-        f"{arrow} <b>{'LONG' if direction=='BUY' else 'SHORT'} ОТКРЫТ</b>  [{exch_tag}] {net_tag}\n"
-        f"#{ticker}  |  {leverage}x  |  {size_usdt} USDT\n"
-        f"📍 Вход: <b>{price}</b>  |  ⛔ SL: {sl_price or '—'}\n"
-        f"✅ TP1: {tp1_price or '—'}  |  TP2: {tp2_price or '—'}\n"
-        f"📦 Объём: {qty} контр."
-    )
-
 
 def handle_tp_hit(payload: dict):
-    ticker    = payload.get("ticker", "").upper().replace(".P", "")
+    ticker = payload.get("ticker", "").upper().replace(".P", "")
     direction = (payload.get("direction") or "").upper()
-    tp_num    = int(payload.get("tp_num") or 0)
-    text      = payload.get("text", "").strip()
-    key       = build_trade_key(payload)
-
-    trade    = get_trade(key) if key else None
-    reply_id = trade["message_id"] if trade else None
-    send_signals(text or f"✅ TP{tp_num} {ticker}", reply_to=reply_id)
-    if tp_num >= 3:
-        update_stats(True)
-        save_trade_to_history(payload, trade, "win", tp_num)
-        if key: remove_trade(key)
+    tp_num = int(payload.get("tp_num") or 0)
+    text = payload.get("text", "").strip()
+    key = build_trade_key(payload)
+    trade_key, trade = find_trade_entry(
+        key=key,
+        trade_id=str(payload.get("trade_id") or ""),
+        ticker=ticker,
+        direction=direction,
+    )
+    reply_id = (trade or {}).get("message_id")
 
     pkey = pos_key(ticker, direction)
+    final_close = False
+    pos_snapshot = None
+    highest_tp = tp_num
     with _pos_lock:
         positions = load_positions()
         pos = positions.get(pkey)
         if not pos:
+            instance_id = _trade_instance_id(trade_key or key, trade, None, payload)
+            if _trade_already_closed(instance_id):
+                write_log(f"TP_DUPLICATE_SKIP | {ticker} TP{tp_num} | already closed")
             return
         if pos.get(f"tp{tp_num}_hit"):
-            return  # идемпотентность
+            write_log(f"TP_DUPLICATE_SKIP | {ticker} TP{tp_num} | already applied")
+            return
 
-        exchange  = pos.get("exchange", "bybit")
+        exchange = pos.get("exchange", "bybit")
         total_qty = pos["total_qty"]
         remaining = pos["remaining_qty"]
-        opp_side  = pos["opp_side"]
+        opp_side = pos["opp_side"]
         close_qty = round(total_qty * TP_CLOSE_PCT.get(tp_num, 0.0), 8)
         close_qty = min(close_qty, remaining)
 
@@ -1033,11 +1269,12 @@ def handle_tp_hit(payload: dict):
 
         new_remaining = max(0.0, remaining - close_qty)
         pos[f"tp{tp_num}_hit"] = True
-        pos["remaining_qty"]   = new_remaining
+        pos["remaining_qty"] = new_remaining
+        highest_tp = _highest_tp_hit(pos)
 
         if tp_num == 2 and pos.get("tp1_price"):
             oid = move_sl(pos, pos["tp1_price"])
-            pos["sl_price"]    = pos["tp1_price"]
+            pos["sl_price"] = pos["tp1_price"]
             pos["sl_order_id"] = oid
 
         if tp_num >= 3 and not pos["trail_active"]:
@@ -1046,33 +1283,58 @@ def handle_tp_hit(payload: dict):
 
         if new_remaining < min_q or tp_num >= 6:
             ex_cancel_all(ticker, exchange)
-            del positions[pkey]
+            positions.pop(pkey, None)
+            final_close = True
         else:
             positions[pkey] = pos
+        pos_snapshot = dict(pos)
         save_positions(positions)
+
+    if trade_key:
+        touch_trade(
+            trade_key,
+            highest_tp_hit=highest_tp,
+            remaining_qty=pos_snapshot.get("remaining_qty"),
+            trail_active=pos_snapshot.get("trail_active", False),
+        )
+    send_signals(text or f"✅ TP{tp_num} {ticker}", reply_to=reply_id or pos_snapshot.get("message_id"))
+    if final_close:
+        finalize_trade(payload, trade_key, trade, pos_snapshot, "win", highest_tp, close_reason=f"tp_hit_{tp_num}")
 
 
 def handle_sl_hit(payload: dict):
-    ticker    = payload.get("ticker", "").upper().replace(".P", "")
+    ticker = payload.get("ticker", "").upper().replace(".P", "")
     direction = (payload.get("direction") or "").upper()
-    text      = payload.get("text", "").strip()
-    key       = build_trade_key(payload)
-
-    trade    = get_trade(key) if key else None
-    reply_id = trade["message_id"] if trade else None
-    send_signals(text or f"🛑 SL {ticker}", reply_to=reply_id)
-    update_stats(False)
-    save_trade_to_history(payload, trade, "loss", 0)
-    if key: remove_trade(key)
+    text = payload.get("text", "").strip()
+    key = build_trade_key(payload)
+    trade_key, trade = find_trade_entry(
+        key=key,
+        trade_id=str(payload.get("trade_id") or ""),
+        ticker=ticker,
+        direction=direction,
+    )
 
     pkey = pos_key(ticker, direction)
+    pos_snapshot = None
+    highest_tp = 0
     with _pos_lock:
         positions = load_positions()
-        pos       = positions.get(pkey)
-        exchange  = pos.get("exchange", "bybit") if pos else "bybit"
+        pos = positions.get(pkey)
+        if not pos:
+            instance_id = _trade_instance_id(trade_key or key, trade, None, payload)
+            if _trade_already_closed(instance_id):
+                write_log(f"SL_DUPLICATE_SKIP | {ticker} | already closed")
+            return
+        exchange = pos.get("exchange", "bybit")
+        highest_tp = _highest_tp_hit(pos)
+        pos_snapshot = dict(pos)
         ex_cancel_all(ticker, exchange)
         positions.pop(pkey, None)
         save_positions(positions)
+    reply_id = (trade or {}).get("message_id") or pos_snapshot.get("message_id")
+    send_signals(text or f"🛑 SL {ticker}", reply_to=reply_id)
+    result = "win" if highest_tp > 0 else "loss"
+    finalize_trade(payload, trade_key, trade, pos_snapshot, result, highest_tp, close_reason="sl_hit")
 
 
 def handle_sl_moved(payload: dict):
@@ -1081,9 +1343,12 @@ def handle_sl_moved(payload: dict):
     text      = payload.get("text", "").strip()
     key       = build_trade_key(payload)
 
-    trade    = get_trade(key) if key else None
-    reply_id = trade["message_id"] if trade else None
-    send_signals(text or f"🔒 SL сдвинут {ticker}", reply_to=reply_id)
+    trade_key, trade = find_trade_entry(
+        key=key,
+        trade_id=str(payload.get("trade_id") or ""),
+        ticker=ticker,
+        direction=direction,
+    )
 
     new_sl = parse_price(text, "✅ Стало:", "Стало:")
     if not new_sl:
@@ -1094,11 +1359,64 @@ def handle_sl_moved(payload: dict):
         pos = positions.get(pkey)
         if not pos:
             return
+        reply_id = (trade or {}).get("message_id") or pos.get("message_id")
+        send_signals(text or f"🔒 SL сдвинут {ticker}", reply_to=reply_id)
         oid = move_sl(pos, new_sl)
         pos["sl_price"]    = new_sl
         pos["sl_order_id"] = oid
         positions[pkey] = pos
         save_positions(positions)
+    if trade_key:
+        touch_trade(trade_key, sl_price=new_sl)
+
+
+def close_position_manually(pos: dict, source: str) -> tuple[bool, str]:
+    ticker = pos["symbol"]
+    direction = pos["direction"]
+    remaining = pos.get("remaining_qty", 0)
+    exchange = pos.get("exchange", "bybit")
+    trade_key, trade = find_trade_entry(
+        key=pos.get("trade_key", ""),
+        trade_id=str(pos.get("trade_id") or ""),
+        ticker=ticker,
+        direction=direction,
+    )
+    if remaining > 0:
+        try:
+            ex_cancel_all(ticker, exchange)
+            ex_place_market(ticker, pos["opp_side"], remaining, True, exchange)
+        except Exception as e:
+            write_log(f"MANUAL_CLOSE_ERR | {ticker} | {e}")
+            return False, f"{ticker}[{exchange}]"
+
+    with _pos_lock:
+        positions = load_positions()
+        positions.pop(pos_key(ticker, direction), None)
+        save_positions(positions)
+
+    reply_id = (trade or {}).get("message_id") or pos.get("message_id")
+    send_signals(
+        f"🧯 <b>Сделка закрыта вручную</b>\n#{ticker} [{exchange}]",
+        reply_to=reply_id,
+    )
+    payload = {
+        "ticker": ticker,
+        "direction": direction,
+        "timeframe": pos.get("timeframe", ""),
+        "trade_id": pos.get("trade_id", ""),
+        "exchange": exchange,
+        "event": "manual_close",
+    }
+    finalize_trade(
+        payload,
+        trade_key,
+        trade,
+        pos,
+        "manual",
+        _highest_tp_hit(pos),
+        close_reason=source,
+    )
+    return True, f"{ticker}[{exchange}]"
 
 
 def process_signal(payload: dict):
@@ -1160,9 +1478,6 @@ def _queue_worker():
                     write_log(f"QUEUE_DEAD | payload={json.dumps(payload)[:200]}")
         else:
             time.sleep(1)
-
-
-threading.Thread(target=_queue_worker, daemon=True, name="queue_worker").start()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1349,9 +1664,6 @@ def _scheduler():
         time.sleep(60)
 
 
-threading.Thread(target=_scheduler, daemon=True, name="scheduler").start()
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # POSITION MANAGER (Trailing Stop)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1396,10 +1708,6 @@ def _position_manager():
         time.sleep(30)
 
 
-if BYBIT_AVAILABLE or BINGX_AVAILABLE:
-    threading.Thread(target=_position_manager, daemon=True, name="pos_mgr").start()
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # KEEPALIVE
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1413,9 +1721,6 @@ def _keepalive():
             except Exception as e:
                 write_log(f"KEEPALIVE_ERR | {e}")
         time.sleep(600)
-
-
-threading.Thread(target=_keepalive, daemon=True, name="keepalive").start()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1514,8 +1819,10 @@ if bot:
         for r in load_history():
             tk = r.get("ticker","?")
             if tk not in by_ticker: by_ticker[tk] = {"wins":0,"losses":0}
-            if r["result"] == "win": by_ticker[tk]["wins"]   += 1
-            else:                    by_ticker[tk]["losses"] += 1
+            if r["result"] == "win":
+                by_ticker[tk]["wins"] += 1
+            elif r["result"] == "loss":
+                by_ticker[tk]["losses"] += 1
         rows = sorted(
             by_ticker.items(),
             key=lambda x: calc_winrate(x[1]["wins"], x[1]["wins"]+x[1]["losses"]),
@@ -1578,18 +1885,10 @@ if bot:
         with _pos_lock:
             positions = dict(load_positions())
         closed = []
-        for pkey, pos in positions.items():
-            ticker    = pos["symbol"]
-            remaining = pos.get("remaining_qty", 0)
-            exchange  = pos.get("exchange", "bybit")
-            if remaining > 0:
-                try:
-                    ex_cancel_all(ticker, exchange)
-                    ex_place_market(ticker, pos["opp_side"], remaining, True, exchange)
-                    closed.append(f"{ticker}[{exchange}]")
-                except Exception as e:
-                    write_log(f"CLOSE_ALL_ERR | {ticker} | {e}")
-        save_positions({}); save_trades({})
+        for _, pos in positions.items():
+            ok, label = close_position_manually(pos, "telegram_close_all")
+            if ok:
+                closed.append(label)
         _reply(m, f"🚨 <b>Закрыто:</b> {', '.join(closed) or 'нет'}")
         send_signals(f"🚨 <b>АВАРИЙНОЕ ЗАКРЫТИЕ</b>\n{', '.join(closed) or 'нет'}")
 
@@ -1674,7 +1973,18 @@ def _register_bg():
     register_webhook()
 
 
-threading.Thread(target=_register_bg, daemon=True, name="webhook_reg").start()
+def start_background_threads():
+    global _bg_started
+    with _bg_lock:
+        if _bg_started:
+            return
+        threading.Thread(target=_queue_worker, daemon=True, name="queue_worker").start()
+        threading.Thread(target=_scheduler, daemon=True, name="scheduler").start()
+        threading.Thread(target=_keepalive, daemon=True, name="keepalive").start()
+        threading.Thread(target=_register_bg, daemon=True, name="webhook_reg").start()
+        if BYBIT_AVAILABLE or BINGX_AVAILABLE:
+            threading.Thread(target=_position_manager, daemon=True, name="pos_mgr").start()
+        _bg_started = True
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1820,18 +2130,10 @@ def close_all_route():
     with _pos_lock:
         positions = dict(load_positions())
     closed = []
-    for pkey, pos in positions.items():
-        ticker    = pos["symbol"]
-        remaining = pos.get("remaining_qty", 0)
-        exchange  = pos.get("exchange", "bybit")
-        if remaining > 0:
-            try:
-                ex_cancel_all(ticker, exchange)
-                ex_place_market(ticker, pos["opp_side"], remaining, True, exchange)
-                closed.append(f"{ticker}[{exchange}]")
-            except Exception as e:
-                write_log(f"CLOSE_ALL_ERR | {ticker} | {e}")
-    save_positions({}); save_trades({})
+    for _, pos in positions.items():
+        ok, label = close_position_manually(pos, "http_close_all")
+        if ok:
+            closed.append(label)
     send_signals(f"🚨 <b>АВАРИЙНОЕ ЗАКРЫТИЕ</b>\nЗакрыто: {', '.join(closed) or 'нет'}")
     return jsonify({"closed": closed})
 
@@ -1871,4 +2173,5 @@ def redis_status_route():
 # ══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
+    start_background_threads()
     app.run(host="0.0.0.0", port=port, debug=False)
