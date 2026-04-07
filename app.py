@@ -1163,19 +1163,29 @@ def handle_entry(payload: dict):
         "timeframe": timeframe,
         "created_at": created_at,
     })
-    trade_message_id = source_msg_id
+    arrow = "🟢" if direction == "BUY" else "🔴"
+    side_label = "LONG" if direction == "BUY" else "SHORT"
     if trade_mode == "trade":
-        entry_message = send_signals(
-            f"{'🟢' if direction == 'BUY' else '🔴'} <b>{'LONG' if direction=='BUY' else 'SHORT'} ОТКРЫТ</b>  "
-            f"[{'Bybit' if exchange == 'bybit' else 'BingX'}] "
-            f"{('🧪 TEST' if TESTNET else '🔴 LIVE') if exchange == 'bybit' else ('🧪 DEMO' if BINGX_DEMO else '🔴 LIVE')}\n"
-            f"#{ticker}  |  {leverage}x  |  {size_usdt} USDT\n"
-            f"📍 Вход: <b>{price}</b>  |  ⛔ SL: {sl_price or '—'}\n"
-            f"✅ TP1: {tp1_price or '—'}  |  TP2: {tp2_price or '—'}\n"
-            f"📦 Объём: {qty} контр.",
-            reply_to=source_msg_id,
-        )
-        trade_message_id = entry_message.get("message_id") or source_msg_id
+        exch_tag = "Bybit" if exchange == "bybit" else "BingX"
+        net_tag = ("🧪 TEST" if TESTNET else "🔴 LIVE") if exchange == "bybit" \
+                  else ("🧪 DEMO" if BINGX_DEMO else "🔴 LIVE")
+        details_line = f"#{ticker}  |  {leverage}x  |  {size_usdt} USDT"
+        volume_line = f"📦 Объём: {qty} контр."
+    else:
+        exch_tag = "Telegram"
+        net_tag = "📢 ONLY"
+        details_line = f"#{ticker}  |  alert only"
+        volume_line = "📦 Исполнение: без биржи"
+    entry_price_text = price if price not in (None, 0.0) else "—"
+    entry_message = send_signals(
+        f"{arrow} <b>{side_label} ОТКРЫТ</b>  [{exch_tag}] {net_tag}\n"
+        f"{details_line}\n"
+        f"📍 Вход: <b>{entry_price_text}</b>  |  ⛔ SL: {sl_price or '—'}\n"
+        f"✅ TP1: {tp1_price or '—'}  |  TP2: {tp2_price or '—'}\n"
+        f"{volume_line}",
+        reply_to=source_msg_id,
+    )
+    trade_message_id = entry_message.get("message_id") or source_msg_id
 
     trade_record = {
         "message_id": trade_message_id,
