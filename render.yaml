@@ -65,3 +65,7 @@ services:
       # ── Хранилище ─────────────────────────────────────────────────
       - key: DATA_DIR
         value: "/tmp"
+
+      # ── Upstash Redis (постоянное хранилище сделок) ───────────────
+      - key: REDIS_URL
+        sync: false          # redis://default:PASSWORD@HOST.upstash.io:PORT
