@@ -725,8 +725,70 @@ def ex_min_qty(ticker: str, exchange: str) -> float:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ХЕЛПЕРЫ ПОЗИЦИЙ
+# TP-ОРДЕРА НА БИРЖЕ
 # ══════════════════════════════════════════════════════════════════════════════
+def bybit_place_tp_limit(symbol: str, side: str, qty: float, price: float) -> dict:
+    """Лимитный TP-ордер на Bybit (reduceOnly, GTC)."""
+    resp = bybit().place_order(
+        category="linear", symbol=symbol,
+        side=side, orderType="Limit",
+        price=round_price(symbol, price),
+        qty=round_qty(symbol, qty),
+        reduceOnly=True, timeInForce="GTC",
+    )
+    write_log(f"BYBIT_TP_LIMIT | {symbol} {side} qty={qty} price={price} | ret={resp['retCode']}")
+    return resp
+
+
+def bingx_place_tp(ticker: str, side: str, qty: float, trigger_price: float) -> dict:
+    """TAKE_PROFIT_MARKET TP-ордер на BingX."""
+    sym      = _bingx_to_symbol(ticker)
+    bx_side  = side.upper()
+    pos_side = "SHORT" if bx_side == "BUY" else "LONG"
+    data = _bingx_req("POST", "/openApi/swap/v2/trade/order", {
+        "symbol": sym, "side": bx_side, "positionSide": pos_side,
+        "type": "TAKE_PROFIT_MARKET", "quantity": str(bingx_round_qty(qty)),
+        "stopPrice": str(round(trigger_price, 8)), "workingType": "CONTRACT_PRICE",
+    })
+    write_log(f"BINGX_TP | {ticker} {side} pos={pos_side} qty={qty} trigger={trigger_price}")
+    return data
+
+
+def place_tp_orders(ticker: str, side: str, opp_side: str, total_qty: float,
+                    tp_prices: dict, exchange: str) -> dict:
+    """
+    Выставляет TP1–TP6 как ордера на бирже.
+    tp_prices: {1: price, 2: price, ...}
+    Возвращает: {1: order_id, 2: order_id, ...}
+    """
+    order_ids: dict = {}
+    for tp_num, price in sorted(tp_prices.items()):
+        pct = TP_CLOSE_PCT.get(tp_num, 0.0)
+        if pct <= 0 or not price:
+            continue
+        close_qty = round(total_qty * pct, 8)
+        try:
+            if exchange == "bybit":
+                min_q = min_qty(ticker)
+                if close_qty < min_q:
+                    write_log(f"TP_ORDER_SKIP | {ticker} TP{tp_num} | qty {close_qty} < min {min_q}")
+                    continue
+                resp = bybit_place_tp_limit(ticker, opp_side, close_qty, price)
+                if resp.get("retCode") == 0:
+                    order_ids[tp_num] = resp["result"].get("orderId", "")
+                else:
+                    write_log(f"TP_ORDER_FAIL | {ticker} TP{tp_num} | {resp.get('retMsg','')}")
+            elif exchange == "bingx":
+                bx_qty = bingx_round_qty(close_qty)
+                if bx_qty < 0.001:
+                    continue
+                resp = bingx_place_tp(ticker, opp_side, bx_qty, price)
+                order_ids[tp_num] = resp.get("data", {}).get("orderId", "") or "ok"
+        except Exception as e:
+            write_log(f"TP_ORDER_ERR | {ticker} TP{tp_num} ({exchange}) | {e}")
+        time.sleep(0.15)
+    write_log(f"TP_ORDERS_PLACED | {ticker} [{exchange}] | {order_ids}")
+    return order_ids
 def parse_price(text: str, *prefixes: str):
     for prefix in prefixes:
         idx = text.find(prefix)
@@ -1109,9 +1171,13 @@ def handle_entry(payload: dict):
     tp2_price = parse_price(text, "TP2:", "✅ TP2:")
     tp3_price = parse_price(text, "TP3:", "✅ TP3:")
     tp4_price = parse_price(text, "TP4:", "✅ TP4:")
+    tp5_price = parse_price(text, "TP5:", "✅ TP5:")
+    tp6_price = parse_price(text, "TP6:", "✅ TP6:")
     price = infer_entry_price(text)
     qty = 1.0
     sl_order_id = ""
+    tp_order_ids: dict = {}
+    use_exchange_tps = False
 
     if trade_mode == "trade":
         ex_set_leverage(ticker, leverage, exchange)
@@ -1150,6 +1216,16 @@ def handle_entry(payload: dict):
                     sl_order_id = resp.get("data", {}).get("orderId", "") or "ok"
             except Exception as e:
                 write_log(f"SL_PLACE_ERR | {ticker} ({exchange}) | {e}")
+
+        # ── Выставляем TP-ордера на биржу ──────────────────────────────────────
+        _tp_map = {n: p for n, p in [
+            (1, tp1_price), (2, tp2_price), (3, tp3_price),
+            (4, tp4_price), (5, tp5_price), (6, tp6_price),
+        ] if p}
+        if _tp_map:
+            time.sleep(0.3)
+            tp_order_ids = place_tp_orders(ticker, side, opp_side, qty, _tp_map, exchange)
+            use_exchange_tps = bool(tp_order_ids)
     else:
         write_log(f"ENTRY_TELEGRAM_ONLY | {ticker} {direction} | no exchange execution")
         if price is None:
@@ -1172,13 +1248,14 @@ def handle_entry(payload: dict):
         details_line = f"#{ticker}  |  {leverage}x  |  {size_usdt} USDT"
         volume_line = f"📦 Объём: {qty} контр."
     else:
-        exch_tag = "Telegram"
-        net_tag = "📢 ONLY"
-        details_line = f"#{ticker}  |  alert only"
+        exch_tag = ""
+        net_tag = ""
+        details_line = f"#{ticker}"
         volume_line = "📦 Исполнение: без биржи"
     entry_price_text = price if price not in (None, 0.0) else "—"
+    tag_str = f"  [{exch_tag}] {net_tag}" if exch_tag else ""
     entry_message = send_signals(
-        f"{arrow} <b>{side_label} ОТКРЫТ</b>  [{exch_tag}] {net_tag}\n"
+        f"{arrow} <b>{side_label} ОТКРЫТ</b>{tag_str}\n"
         f"{details_line}\n"
         f"📍 Вход: <b>{entry_price_text}</b>  |  ⛔ SL: {sl_price or '—'}\n"
         f"✅ TP1: {tp1_price or '—'}  |  TP2: {tp2_price or '—'}\n"
@@ -1233,6 +1310,10 @@ def handle_entry(payload: dict):
             "tp2_price": tp2_price,
             "tp3_price": tp3_price,
             "tp4_price": tp4_price,
+            "tp5_price": tp5_price,
+            "tp6_price": tp6_price,
+            "tp_order_ids": tp_order_ids,
+            "use_exchange_tps": use_exchange_tps,
             "trade_id": trade_id,
             "trade_key": key,
             "instance_id": instance_id,
@@ -1286,14 +1367,17 @@ def handle_tp_hit(payload: dict):
         min_q = ex_min_qty(ticker, exchange) if exchange != "none" else 0.0
 
         if exchange != "none":
-            if close_qty < min_q:
-                return
-
-            try:
-                ex_place_market(ticker, opp_side, close_qty, True, exchange)
-            except Exception as e:
-                write_log(f"TP_HIT_ERR | {ticker} TP{tp_num} ({exchange}) | {e}")
-                return
+            if pos.get("use_exchange_tps"):
+                # TP-ордер уже исполнен биржей как лимитная заявка
+                write_log(f"TP_HIT_EXCHANGE | {ticker} TP{tp_num} | limit order filled by exchange")
+            else:
+                if close_qty < min_q:
+                    return
+                try:
+                    ex_place_market(ticker, opp_side, close_qty, True, exchange)
+                except Exception as e:
+                    write_log(f"TP_HIT_ERR | {ticker} TP{tp_num} ({exchange}) | {e}")
+                    return
         elif close_qty <= 0:
             close_qty = 0.0
 
@@ -1302,14 +1386,7 @@ def handle_tp_hit(payload: dict):
         pos["remaining_qty"] = new_remaining
         highest_tp = _highest_tp_hit(pos)
 
-        if tp_num == 2 and pos.get("tp1_price"):
-            oid = ""
-            if exchange != "none":
-                oid = move_sl(pos, pos["tp1_price"])
-            pos["sl_price"] = pos["tp1_price"]
-            pos["sl_order_id"] = oid
-
-        if tp_num >= 3 and not pos["trail_active"]:
+        if tp_num >= 2 and not pos["trail_active"]:
             pos["trail_active"] = True
             pos["trail_sl"]     = pos.get("sl_price")
 
@@ -1742,7 +1819,7 @@ def _position_manager():
 
         except Exception as e:
             write_log(f"POS_MGR_ERR | {e}")
-        time.sleep(30)
+        time.sleep(120)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
