@@ -116,14 +116,13 @@ ALLOWED_PAIRS = BYBIT_PAIRS | BINGX_PAIRS
 
 DEFAULT_LEVERAGE  = int(os.environ.get("DEFAULT_LEVERAGE",  "10"))
 DEFAULT_SIZE_USDT = float(os.environ.get("DEFAULT_SIZE_USDT", "1"))
-TRAIL_PCT         = float(os.environ.get("TRAIL_PCT","0.5")) / 100.0
+TRAIL_PCT         = float(os.environ.get("TRAIL_PCT", "0.5")) / 100.0
 
 try:
     PAIR_SETTINGS: dict = json.loads(os.environ.get("PAIR_SETTINGS_JSON", "{}"))
 except Exception:
     PAIR_SETTINGS = {}
 
-TRAIL_PCT    = float(os.environ.get("TRAIL_PCT", "0.5")) / 100.0
 TP_CLOSE_PCT = {1: 0.25, 2: 0.20, 3: 0.25, 4: 0.15, 5: 0.10, 6: 0.05}
 
 DATA_DIR = os.environ.get("DATA_DIR", "/tmp")
@@ -1086,12 +1085,18 @@ def remove_trade(key: str):
             save_trades(t)
 
 
-def dedup_entry(ticker: str, direction: str):
+def dedup_entry(ticker: str, direction: str, current_key: str = ""):
+    """Удаляет старые записи о сделке по тому же тикеру/направлению.
+    Защита: не трогает текущую сделку (current_key) и записи новее 60 сек."""
+    now = int(time.time())
     with _state_lock:
         trades = load_trades()
         keys_to_remove = [
             k for k, v in trades.items()
-            if v.get("ticker", "") == ticker and v.get("direction", "") == direction
+            if v.get("ticker", "") == ticker
+            and v.get("direction", "") == direction
+            and k != current_key
+            and now - int(v.get("created_at", 0)) > 60
         ]
         for k in keys_to_remove:
             del trades[k]
@@ -1285,7 +1290,7 @@ def handle_entry(payload: dict):
         "remaining_qty": qty,
         "sl_price": sl_price,
     }
-    dedup_entry(ticker, direction)
+    dedup_entry(ticker, direction, current_key=key)
     if key:
         put_trade(key, trade_record)
 
