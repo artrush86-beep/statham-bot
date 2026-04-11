@@ -841,7 +841,8 @@ def move_sl(pos: dict, new_sl: float) -> str:
     symbol    = pos["symbol"]
     opp_side  = pos["opp_side"]
     remaining = pos.get("remaining_qty", pos["total_qty"])
-    if remaining <= 0:
+    # Не трогаем позиции без биржи или с нулевым объёмом
+    if exchange == "none" or remaining <= 0:
         return ""
     ex_cancel_all(symbol, exchange)
     time.sleep(0.3)
@@ -1821,10 +1822,26 @@ def _position_manager():
                 snapshot = dict(load_positions())
 
             for pkey, pos in snapshot.items():
+                exchange = pos.get("exchange", "bybit")
+                remaining = pos.get("remaining_qty", 0)
+
+                # Удаляем мёртвые позиции (нулевой объём или без биржи без trail)
+                if remaining <= 0 or (exchange == "none" and not pos.get("trail_active")):
+                    with _pos_lock:
+                        p2 = load_positions()
+                        if pkey in p2:
+                            p2.pop(pkey)
+                            save_positions(p2)
+                            write_log(f"POS_MGR_CLEANUP | {pkey} | exchange={exchange} remaining={remaining}")
+                    continue
+
+                # Позиции без биржи — только telegram-only, trailing stop не нужен
+                if exchange == "none":
+                    continue
+
                 if not pos.get("trail_active"):
                     continue
                 ticker   = pos["symbol"]
-                exchange = pos.get("exchange", "bybit")
                 cur_sl   = pos.get("trail_sl") or pos.get("sl_price") or 0
                 try:
                     price = ex_get_price(ticker, exchange)
