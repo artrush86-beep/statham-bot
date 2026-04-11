@@ -82,7 +82,7 @@ TG_SIGNALS_TOPIC  = os.environ.get("TG_SIGNALS_TOPIC",  "6314")
 TG_SESSIONS_TOPIC = os.environ.get("TG_SESSIONS_TOPIC", "1")
 RENDER_URL        = os.environ.get("RENDER_URL",        "")
 
-TESTNET = os.environ.get("TESTNET", "true").lower() == "true"
+TESTNET = os.environ.get("TESTNET", "false").lower() == "true"
 
 # Bybit
 BYBIT_API_KEY    = os.environ.get("BYBIT_API_KEY",    "")
@@ -187,13 +187,35 @@ bot = telebot.TeleBot(TG_TOKEN, threaded=False) if TG_TOKEN else None
 # СТАРТОВЫЕ ПРЕДУПРЕЖДЕНИЯ
 # ══════════════════════════════════════════════════════════════════════════════
 def _startup_warnings():
-    # Секреты не используются
     if not TESTNET and (BYBIT_AVAILABLE or BINGX_AVAILABLE):
         log.warning("LIVE TRADING ACTIVE! TESTNET=false — торговля реальными деньгами!")
     if BYBIT_AVAILABLE:
         log.info(f"Bybit active | testnet={TESTNET} | pairs={sorted(BYBIT_PAIRS)}")
     if BINGX_AVAILABLE:
         log.info(f"BingX active | demo={BINGX_DEMO} | pairs={sorted(BINGX_PAIRS)}")
+
+    # ── Redis — обязательное хранилище ───────────────────────────────────
+    redis_url = os.environ.get("REDIS_URL", "").strip()
+    if not redis_url:
+        log.critical(
+            "REDIS_URL не задана! Все данные (сделки, позиции, история) "
+            "хранятся только в /tmp и будут ПОТЕРЯНЫ при перезапуске Render. "
+            "Задайте REDIS_URL в переменных окружения."
+        )
+    elif not _REDIS_AVAILABLE:
+        log.critical(
+            "Пакет redis не установлен. "
+            "Данные хранятся только в /tmp — при перезапуске ПОТЕРЯЮТСЯ!"
+        )
+    else:
+        r = _get_redis()
+        if r is None:
+            log.critical(
+                "Redis недоступен (соединение не установлено). "
+                "Данные хранятся только в /tmp — при перезапуске ПОТЕРЯЮТСЯ!"
+            )
+        else:
+            log.info("Redis | storage OK — данные персистентны")
 
 _startup_warnings()
 
@@ -220,6 +242,10 @@ def _rate_ok(ip: str) -> bool:
             return False
         times.append(now)
         _rate_store[ip] = times
+        # Удаляем IP-адреса без активных запросов (чистим утечку памяти)
+        stale = [k for k, v in _rate_store.items() if not v]
+        for k in stale:
+            del _rate_store[k]
     return True
 
 
@@ -231,13 +257,14 @@ def write_log(entry: str):
     line = f"[{ts}] {entry}\n"
     log.info(entry)
     try:
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(line)
-        with open(LOG_FILE, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        if len(lines) > 1000:
-            with open(LOG_FILE, "w", encoding="utf-8") as f:
-                f.writelines(lines[-1000:])
+        with _file_lock:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line)
+            with open(LOG_FILE, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            if len(lines) > 1000:
+                with open(LOG_FILE, "w", encoding="utf-8") as f:
+                    f.writelines(lines[-1000:])
     except Exception:
         pass
 
@@ -1744,7 +1771,7 @@ def _scheduler():
                         send_signals(_build_report(week_trades, f"📅 <b>Недельный отчёт {week_key}</b>"))
 
             last_day = calendar.monthrange(msk.year, msk.month)[1]
-            if msk.day == last_day and h == 23 and 59 <= m <= 59:
+            if msk.day == last_day and h == 23 and 55 <= m <= 59:
                 month_key = f"{msk.year}-{msk.month:02d}"
                 key = f"monthly_{month_key}"
                 if not _was_sent(key):
