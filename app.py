@@ -541,15 +541,19 @@ def bybit_place_market(symbol: str, side: str, qty: float, reduce_only: bool = F
 
 def bybit_place_stop(symbol: str, side: str, qty: float,
                      trigger_price: float, reduce_only: bool = True) -> dict:
+    # triggerDirection: 1 = price rises above triggerPrice (SHORT SL → side=Buy)
+    #                   2 = price falls below triggerPrice  (LONG  SL → side=Sell)
+    trigger_direction = 1 if side.lower() == "buy" else 2
     resp = bybit().place_order(
         category="linear", symbol=symbol,
         side=side, orderType="Market",
         qty=round_qty(symbol, qty),
         triggerPrice=round_price(symbol, trigger_price),
-        triggerBy="LastPrice", orderFilter="StopOrder",
+        triggerBy="LastPrice", triggerDirection=trigger_direction,
+        orderFilter="StopOrder",
         reduceOnly=reduce_only, timeInForce="IOC",
     )
-    write_log(f"BYBIT_STOP | {symbol} {side} qty={qty} trigger={trigger_price} | ret={resp['retCode']}")
+    write_log(f"BYBIT_STOP | {symbol} {side} qty={qty} trigger={trigger_price} dir={trigger_direction} | ret={resp['retCode']}")
     return resp
 
 
@@ -667,12 +671,17 @@ def bingx_place_stop(ticker: str, side: str, qty: float,
     bx_side  = side.upper()
     pos_side = ("LONG" if bx_side == "BUY" else "SHORT") if not reduce_only \
                else ("SHORT" if bx_side == "BUY" else "LONG")
+    # BingX fills may be slightly less than ordered qty (exchange rounding).
+    # Floor to 1 decimal place for SL to ensure qty ≤ actual filled position.
+    safe_qty = math.floor(qty * 10) / 10
+    if safe_qty <= 0:
+        safe_qty = bingx_round_qty(qty)
     data = _bingx_req("POST", "/openApi/swap/v2/trade/order", {
         "symbol": sym, "side": bx_side, "positionSide": pos_side,
-        "type": "STOP_MARKET", "quantity": str(bingx_round_qty(qty)),
+        "type": "STOP_MARKET", "quantity": str(bingx_round_qty(safe_qty)),
         "stopPrice": str(round(trigger_price, 8)), "workingType": "CONTRACT_PRICE",
     })
-    write_log(f"BINGX_STOP | {ticker} {side} pos={pos_side} qty={qty} trigger={trigger_price}")
+    write_log(f"BINGX_STOP | {ticker} {side} pos={pos_side} qty={qty}→{safe_qty} trigger={trigger_price}")
     return data
 
 
