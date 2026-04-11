@@ -1016,30 +1016,85 @@ def _mark_trade_closed(instance_id: str, result: str, close_reason: str) -> bool
         return True
 
 
-def _build_report(trades: list, title: str) -> str:
-    wins = [r for r in trades if r["result"] == "win"]
-    losses = [r for r in trades if r["result"] == "loss"]
+def _wr_icon(wr: float) -> str:
+    if wr >= 70: return "🟢"
+    if wr >= 50: return "🟡"
+    return "🔴"
+
+
+def _build_report(trades: list, title: str, show_last: int = 5,
+                  show_top_tickers: bool = False, date_range: str = "") -> str:
+    wins    = [r for r in trades if r["result"] == "win"]
+    losses  = [r for r in trades if r["result"] == "loss"]
     manuals = [r for r in trades if r["result"] == "manual"]
-    scored_total = len(wins) + len(losses)
-    total = len(trades)
-    wr = calc_winrate(len(wins), scored_total)
+    scored  = len(wins) + len(losses)
+    total   = len(trades)
+    wr      = calc_winrate(len(wins), scored)
     avg_dur = int(sum(r.get("duration_sec", 0) for r in trades) / total) if total else 0
+
     tp_counts: dict = {}
     for r in wins:
-        k = f"TP{r['tp_num']}"
-        tp_counts[k] = tp_counts.get(k, 0) + 1
-    text = f"{title}\n\n"
-    text += f"📊 Win Rate: <b>{wr}%</b>\n"
-    text += f"✅ TP: {len(wins)}   ❌ SL: {len(losses)}\n"
-    text += f"📈 Всего закрыто: {total}\n"
+        n = int(r.get("tp_num") or 0)
+        if n:
+            tp_counts[n] = tp_counts.get(n, 0) + 1
+
+    # ── Заголовок ────────────────────────────────────────────────────
+    text = f"{title}\n"
+    if date_range:
+        text += f"<i>{date_range}</i>\n"
+    text += "\n"
+
+    # ── Основные цифры ───────────────────────────────────────────────
+    text += f"📊 Win Rate: <b>{_wr_icon(wr)} {wr}%</b>\n"
+    text += f"✅ TP: {len(wins)}   ❌ SL: {len(losses)}"
     if manuals:
-        text += f"🧯 Manual close: {len(manuals)}\n"
+        text += f"   🧯 Manual: {len(manuals)}"
+    text += f"\n📈 Всего закрыто: <b>{total}</b>\n"
     text += f"⏱ Ср. время: {fmt_duration(avg_dur)}\n"
+
+    # ── Разбивка по TP ───────────────────────────────────────────────
     if tp_counts:
         text += "\n<b>Разбивка по TP:</b>\n"
-        for tp, cnt in sorted(tp_counts.items()):
-            text += f"  {tp}: {cnt} ✅\n"
-    return text
+        for n, cnt in sorted(tp_counts.items()):
+            bar = "█" * cnt
+            text += f"  TP{n}: {cnt} ✅  <code>{bar}</code>\n"
+
+    # ── Топ тикеры (для недельного/месячного) ────────────────────────
+    if show_top_tickers and total > 0:
+        by_tk: dict = {}
+        for r in trades:
+            tk = r.get("ticker", "?")
+            by_tk[tk] = by_tk.get(tk, 0) + 1
+        top = sorted(by_tk.items(), key=lambda x: x[1], reverse=True)[:5]
+        # Активных дней
+        days = len({r.get("date_msk", "") for r in trades if r.get("date_msk")})
+        text += f"\n📅 Активных дней: <b>{days}</b>\n"
+        text += "\n<b>Топ тикеры:</b>\n"
+        for tk, cnt in top:
+            text += f"  #{tk.replace('.P','')}: {cnt}\n"
+
+    # ── Последние сделки ─────────────────────────────────────────────
+    if show_last and total > 0:
+        recent = sorted(trades, key=lambda r: r.get("close_time", 0), reverse=True)[:show_last]
+        text += "\n<b>Последние сделки:</b>\n"
+        for r in recent:
+            tk   = r.get("ticker", "?").replace(".P", "")
+            dr   = r.get("direction", "")
+            res  = r.get("result", "")
+            tp_n = int(r.get("tp_num") or 0)
+            dur  = fmt_duration(int(r.get("duration_sec", 0)))
+            if res == "win":
+                icon = "✅"
+                label = f"TP{tp_n}" if tp_n else "TP"
+            elif res == "loss":
+                icon = "❌"
+                label = "SL"
+            else:
+                icon = "🧯"
+                label = "Manual"
+            text += f"{icon} #{tk} {dr} → {label} ({dur})\n"
+
+    return text.rstrip()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1719,7 +1774,9 @@ SESSIONS = [
 def _sessions_status() -> str:
     msk = _msk()
     cur = msk.hour * 60 + msk.minute
-    lines = [f"🕐 <b>Торговые сессии</b> ({msk.strftime('%H:%M')} МСК)\n"]
+    active = []
+    upcoming = []
+    lines_all = []
     for s in SESSIONS:
         oh, om = map(int, s["open"].split(":"))
         ch, cm = map(int, s["close"].split(":"))
@@ -1729,9 +1786,34 @@ def _sessions_status() -> str:
             is_open = cur >= o_min or cur < c_min
         else:
             is_open = o_min <= cur < c_min
+        if is_open:
+            active.append(s["name"])
+        else:
+            # Минут до открытия
+            diff = o_min - cur
+            if diff < 0:
+                diff += 1440
+            upcoming.append((diff, s["name"], s["open"]))
         status = "🟢 Открыта" if is_open else "🔴 Закрыта"
-        lines.append(f"{s['name']}  {s['open']}–{s['close']}  {status}")
-    return "\n".join(lines)
+        lines_all.append(f"{s['name']}  {s['open']}–{s['close']}  {status}")
+
+    text = f"🕐 <b>Время МСК: {msk.strftime('%H:%M')}</b>\n"
+    if active:
+        text += f"📊 Активные сессии: <b>{', '.join(a.split()[-1] for a in active)}</b>\n"
+    else:
+        text += "📊 Активные сессии: —\n"
+
+    if upcoming:
+        upcoming.sort()
+        mins_left, next_name, next_open = upcoming[0]
+        h_left, m_left = divmod(mins_left, 60)
+        dur_str = f"{h_left}ч {m_left}м" if h_left else f"{m_left}м"
+        short = next_name.split()[-1]
+        text += f"⏰ Следующее: <b>{short}</b> в {next_open} МСК (через {dur_str})\n"
+
+    text += f"\n📅 <b>Расписание (МСК):</b>\n"
+    text += "\n".join(lines_all)
+    return text
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1921,6 +2003,7 @@ if bot:
             "/leaders — топ пар по WR\n"
             "/active — открытые позиции\n\n"
             "<b>🧭 Рынок:</b>\n"
+            "/market — F&G + сессии одним сообщением\n"
             "/fear_greed — F&G индекс\n"
             "/sessions — торговые сессии\n"
             "/pairs — разбивка пар по биржам\n\n"
@@ -1937,64 +2020,160 @@ if bot:
 
     @bot.message_handler(commands=["stats"])
     def cmd_stats(m):
-        s    = load_stats()
-        wins = s.get("wins", 0); losses = s.get("losses", 0); total = s.get("total", 0)
-        _reply(m, (f"📊 <b>Общая статистика</b>\n\n"
-                   f"Win Rate: <b>{calc_winrate(wins, total)}%</b>\n"
-                   f"✅ TP: {wins}   ❌ SL: {losses}\n"
-                   f"📈 Всего сделок: {total}"))
+        s      = load_stats()
+        wins   = s.get("wins", 0)
+        losses = s.get("losses", 0)
+        total  = s.get("total", 0)
+        wr     = calc_winrate(wins, wins + losses)
+        # TP ≥ 3 из истории
+        history = load_history()
+        tp3plus = sum(1 for r in history if r.get("result") == "win"
+                      and int(r.get("tp_num") or 0) >= 3)
+        _reply(m, (
+            f"📊 <b>Статистика Statham Strategy</b>\n\n"
+            f"{_wr_icon(wr)} Win Rate: <b>{wr}%</b>\n"
+            f"✅ TP (≥TP3): {tp3plus}   ✅ TP всего: {wins}\n"
+            f"❌ SL: {losses}\n"
+            f"📈 Всего закрыто: <b>{total}</b>"
+        ))
 
     @bot.message_handler(commands=["daily_report"])
     def cmd_daily(m):
         today = _msk().strftime("%Y-%m-%d")
         ts    = [r for r in load_history() if r.get("date_msk") == today]
-        if not ts: _reply(m, f"📅 Сегодня ({today}) закрытых сделок нет."); return
-        _reply(m, _build_report(ts, f"📅 <b>Дневной отчёт {today}</b>"))
+        if not ts:
+            _reply(m, f"📅 Сегодня ({today}) закрытых сделок нет.")
+            return
+        _reply(m, _build_report(ts, f"📅 <b>Дневной отчёт {today}</b>",
+                                 show_last=5, show_top_tickers=False))
 
     @bot.message_handler(commands=["weekly_report"])
     def cmd_weekly(m):
-        msk = _msk(); wk = f"{msk.year}-W{msk.isocalendar()[1]:02d}"
-        ts  = [r for r in load_history() if r.get("week_msk") == wk]
-        if not ts: _reply(m, f"📅 На этой неделе ({wk}) закрытых сделок нет."); return
-        _reply(m, _build_report(ts, f"📅 <b>Недельный отчёт {wk}</b>"))
+        msk  = _msk()
+        wk   = f"{msk.year}-W{msk.isocalendar()[1]:02d}"
+        # Дата начала/конца недели (пн–вс)
+        week_day   = msk.weekday()
+        week_start = (msk - datetime.timedelta(days=week_day)).strftime("%d.%m")
+        week_end   = (msk + datetime.timedelta(days=6 - week_day)).strftime("%d.%m.%Y")
+        ts = [r for r in load_history() if r.get("week_msk") == wk]
+        if not ts:
+            _reply(m, f"📅 На этой неделе ({wk}) закрытых сделок нет.")
+            return
+        _reply(m, _build_report(
+            ts,
+            f"📅 <b>Недельный отчёт</b>",
+            date_range=f"с {week_start} по {week_end}",
+            show_last=0,
+            show_top_tickers=True,
+        ))
 
     @bot.message_handler(commands=["monthly_report"])
     def cmd_monthly(m):
-        msk = _msk(); mo = f"{msk.year}-{msk.month:02d}"
-        ts  = [r for r in load_history() if r.get("date_msk","").startswith(mo)]
-        if not ts: _reply(m, f"📅 В этом месяце ({mo}) закрытых сделок нет."); return
-        _reply(m, _build_report(ts, f"📅 <b>Месячный отчёт {mo}</b>"))
+        msk = _msk()
+        mo  = f"{msk.year}-{msk.month:02d}"
+        import calendar as _cal
+        month_name_ru = {1:"Январь",2:"Февраль",3:"Март",4:"Апрель",
+                         5:"Май",6:"Июнь",7:"Июль",8:"Август",
+                         9:"Сентябрь",10:"Октябрь",11:"Ноябрь",12:"Декабрь"}
+        ts = [r for r in load_history() if r.get("date_msk","").startswith(mo)]
+        if not ts:
+            _reply(m, f"📅 В этом месяце ({mo}) закрытых сделок нет.")
+            return
+        title = f"📅 <b>Месячный отчёт — {month_name_ru.get(msk.month, mo)} {msk.year}</b>"
+        _reply(m, _build_report(ts, title, show_last=0, show_top_tickers=True))
 
     @bot.message_handler(commands=["stats_by_ticker"])
     def cmd_stats_by_ticker(m):
         parts = m.text.split()
         if len(parts) < 2:
-            _reply(m, "❌ Укажи тикер: /stats_by_ticker BTCUSDT"); return
-        ticker = parts[1].upper().replace(".P","")
-        ts     = [r for r in load_history()
-                  if r.get("ticker","").replace(".P","").upper() == ticker]
-        if not ts: _reply(m, f"Нет данных по {ticker}"); return
-        _reply(m, _build_report(ts, f"📊 <b>Статистика {ticker}</b>"))
+            _reply(m, "❌ Укажи тикер: /stats_by_ticker BTCUSDT")
+            return
+        ticker = parts[1].upper().replace(".P", "")
+        ts = [r for r in load_history()
+              if r.get("ticker", "").replace(".P", "").upper() == ticker]
+        if not ts:
+            _reply(m, f"Нет данных по {ticker}")
+            return
+        _reply(m, _build_report(ts, f"📊 <b>Статистика #{ticker}</b>",
+                                 show_last=5, show_top_tickers=False))
 
     @bot.message_handler(commands=["leaders"])
     def cmd_leaders(m):
         by_ticker: dict = {}
         for r in load_history():
-            tk = r.get("ticker","?")
-            if tk not in by_ticker: by_ticker[tk] = {"wins":0,"losses":0}
-            if r["result"] == "win":
-                by_ticker[tk]["wins"] += 1
-            elif r["result"] == "loss":
-                by_ticker[tk]["losses"] += 1
-        rows = sorted(
-            by_ticker.items(),
-            key=lambda x: calc_winrate(x[1]["wins"], x[1]["wins"]+x[1]["losses"]),
-            reverse=True)[:10]
-        if not rows: _reply(m, "Нет данных."); return
-        lines = ["🏆 <b>Топ-10 пар по WR</b>\n"]
-        for tk, d in rows:
-            total = d["wins"] + d["losses"]
-            lines.append(f"  {tk}  {calc_winrate(d['wins'],total)}%  ({d['wins']}✅/{d['losses']}❌)")
+            tk = r.get("ticker", "?").replace(".P", "")
+            if tk not in by_ticker:
+                by_ticker[tk] = {"wins": 0, "losses": 0, "tp_counts": {}}
+            d      = by_ticker[tk]
+            result = r.get("result", "")
+            tp_num = int(r.get("tp_num") or 0)
+            highest= int(r.get("highest_tp_hit") or 0)
+            if result == "win":
+                d["wins"] += 1
+                best = max(tp_num, highest)
+                if best > 0:
+                    d["tp_counts"][best] = d["tp_counts"].get(best, 0) + 1
+            elif result == "loss":
+                d["losses"] += 1
+
+        if not by_ticker:
+            _reply(m, "Нет данных.")
+            return
+
+        def _wr_val(d):
+            t = d["wins"] + d["losses"]
+            return calc_winrate(d["wins"], t) if t else -1
+
+        scored = [(tk, d) for tk, d in by_ticker.items()
+                  if d["wins"] + d["losses"] > 0]
+        scored_by_wr = sorted(scored, key=lambda x: (_wr_val(x[1]), x[1]["wins"]), reverse=True)
+
+        best  = scored_by_wr[:5]
+        worst = list(reversed(scored_by_wr[-5:])) if len(scored_by_wr) > 5 else []
+
+        medals_best  = ["🥇","🥈","🥉","4️⃣","5️⃣"]
+        medals_worst = ["🔻","🔻","🔻","🔻","🔻"]
+
+        total_wins   = sum(d["wins"]   for _, d in by_ticker.items())
+        total_losses = sum(d["losses"] for _, d in by_ticker.items())
+        total_all    = total_wins + total_losses
+        overall_wr   = calc_winrate(total_wins, total_all)
+        tickers_cnt  = len(scored)
+
+        msk = _msk()
+        week_day   = msk.weekday()
+        week_start = (msk - datetime.timedelta(days=week_day)).strftime("%d.%m")
+        week_end   = msk.strftime("%d.%m")
+
+        lines = [f"📊 <b>Топ пар по Win Rate</b>",
+                 f"<i>с {week_start} по {week_end}</i>\n"]
+
+        lines.append("🏆 <b>Лучшие тикеры:</b>")
+        for i, (tk, d) in enumerate(best):
+            wr  = _wr_val(d)
+            tot = d["wins"] + d["losses"]
+            tp_str = " ".join(f"TP{n}×{c}" for n, c in sorted(d["tp_counts"].items()) if c)
+            lines.append(
+                f"{medals_best[i]} <b>#{tk}</b> — WR {wr:.1f}% "
+                f"({d['wins']}W/{d['losses']}L из {tot})"
+                + (f"\n   <i>{tp_str}</i>" if tp_str else "")
+            )
+
+        if worst:
+            lines.append("\n📉 <b>Худшие тикеры:</b>")
+            for i, (tk, d) in enumerate(worst):
+                wr  = _wr_val(d)
+                tot = d["wins"] + d["losses"]
+                lines.append(
+                    f"{medals_worst[i]} <b>#{tk}</b> — WR {wr:.1f}% "
+                    f"({d['wins']}W/{d['losses']}L из {tot})"
+                )
+
+        lines.append(
+            f"\nВсего тикеров: <b>{tickers_cnt}</b> | Сделок: <b>{total_all}</b>\n"
+            f"📊 Общий WR: <b>{_wr_icon(overall_wr)} {overall_wr}%</b>  "
+            f"({total_wins}✅ / {total_losses}❌)"
+        )
         _reply(m, "\n".join(lines))
 
     @bot.message_handler(commands=["active"])
@@ -2030,6 +2209,19 @@ if bot:
     @bot.message_handler(commands=["sessions"])
     def cmd_sessions(m):
         _reply(m, _sessions_status())
+
+    @bot.message_handler(commands=["market"])
+    def cmd_market(m):
+        fg = _fetch_fg()
+        fg_line = ""
+        if fg:
+            v = fg["value"]
+            label = fg["label"]
+            fg_line = f"{_fg_emoji(v)} F&G: <b>{v}</b> — {label}\n"
+        else:
+            fg_line = "😐 F&G: недоступен\n"
+        text = f"🌐 <b>Рынок</b>\n\n{fg_line}\n{_sessions_status()}"
+        _reply(m, text)
 
     @bot.message_handler(commands=["balance"])
     def cmd_balance(m):
