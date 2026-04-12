@@ -1263,14 +1263,29 @@ def handle_entry(payload: dict):
     leverage  = int(cfg["leverage"])
     size_usdt = float(cfg["size_usdt"])
 
-    sl_price  = parse_price(text, "SL:", "⛔ SL:")
-    tp1_price = parse_price(text, "TP1:", "✅ TP1:")
-    tp2_price = parse_price(text, "TP2:", "✅ TP2:")
-    tp3_price = parse_price(text, "TP3:", "✅ TP3:")
-    tp4_price = parse_price(text, "TP4:", "✅ TP4:")
-    tp5_price = parse_price(text, "TP5:", "✅ TP5:")
-    tp6_price = parse_price(text, "TP6:", "✅ TP6:")
-    price = infer_entry_price(text)
+    # ── Хелпер: безопасный float из payload-поля ──────────────────────
+    def _to_float(val) -> float | None:
+        try:
+            return float(val) if val not in (None, "", "null") else None
+        except Exception:
+            return None
+
+    # ── Парсим TP/SL: сначала из текста, затем fallback на числовые поля JSON ──
+    sl_price  = parse_price(text, "SL:", "⛔ SL:")   or _to_float(payload.get("sl"))
+    tp1_price = parse_price(text, "TP1:", "✅ TP1:") or _to_float(payload.get("tp1"))
+    tp2_price = parse_price(text, "TP2:", "✅ TP2:") or _to_float(payload.get("tp2"))
+    tp3_price = parse_price(text, "TP3:", "✅ TP3:") or _to_float(payload.get("tp3"))
+    tp4_price = parse_price(text, "TP4:", "✅ TP4:") or _to_float(payload.get("tp4"))
+    tp5_price = parse_price(text, "TP5:", "✅ TP5:") or _to_float(payload.get("tp5"))
+    tp6_price = parse_price(text, "TP6:", "✅ TP6:") or _to_float(payload.get("tp6"))
+
+    # ── Цена входа: из текста, затем из JSON-поля entry_price ────────
+    price = infer_entry_price(text) or _to_float(payload.get("entry_price"))
+
+    # ── Диагностика — видно что распарсилось ──────────────────────────
+    write_log(f"PARSED | {ticker} entry={price} sl={sl_price} "
+              f"tp1={tp1_price} tp2={tp2_price} tp3={tp3_price} "
+              f"tp4={tp4_price} tp5={tp5_price} tp6={tp6_price}")
     qty = 1.0
     sl_order_id = ""
     tp_order_ids: dict = {}
