@@ -1653,7 +1653,15 @@ def process_signal(payload: dict):
     event = payload.get("event", "unknown")
     if event == "enty":  # алиас опечатки из TradingView
         event = "entry"
-    write_log(f"PROCESS | event={event} | ticker={payload.get('ticker','?')}")
+    
+    # ⏰ Логирование задержки между TradingView и ботом
+    alert_time_ms = payload.get("alert_time")
+    if alert_time_ms:
+        delay_ms = int(time.time() * 1000) - alert_time_ms
+        delay_sec = delay_ms / 1000
+        write_log(f"PROCESS | event={event} | ticker={payload.get('ticker','?')} | delay={delay_sec:.2f}s")
+    else:
+        write_log(f"PROCESS | event={event} | ticker={payload.get('ticker','?')}")
 
     text = payload.get("text", "").strip()
     key  = build_trade_key(payload)
@@ -1691,19 +1699,39 @@ def _queue_worker():
         if item:
             payload  = item["payload"]
             attempts = item["attempts"]
+            queued_at = item.get("queued_at", 0)
+            retry_after = item.get("retry_after", 0)
+            
+            # ⏰ Если элемент запланирован на будущее - возвращаем в очередь
+            now = time.time()
+            if retry_after > now:
+                with _queue_lock:
+                    _signal_queue.append(item)
+                time.sleep(0.5)
+                continue
+            
+            # ⏰ Показываем время ожидания в очереди
+            wait_time = now - queued_at
+            if wait_time > 5:  # Предупреждаем если ждали больше 5 секунд
+                write_log(f"QUEUE_WAIT | ticker={payload.get('ticker','?')} | wait={wait_time:.2f}s | attempts={attempts}")
+            
             try:
                 process_signal(payload)
             except Exception as e:
-                write_log(f"QUEUE_ERR | attempt={attempts} | {e}")
+                write_log(f"QUEUE_ERR | attempt={attempts} | ticker={payload.get('ticker','?')} | {e}")
                 if attempts < MAX_QUEUE_ATTEMPTS - 1:
                     item["attempts"] += 1
-                    time.sleep(QUEUE_RETRY_DELAY)
+                    # 🔁 Экспоненциальная задержка: 1s, 2s, 4s вместо фиксированных 15s
+                    retry_delay = min(2 ** attempts, 15)
+                    item["retry_after"] = time.time() + retry_delay
                     with _queue_lock:
-                        _signal_queue.insert(0, item)
+                        # Кладём в КОНЕЦ очереди, не блокируя другие сигналы
+                        _signal_queue.append(item)
+                    write_log(f"QUEUE_RETRY | ticker={payload.get('ticker','?')} | delay={retry_delay}s | attempt={attempts+1}")
                 else:
-                    write_log(f"QUEUE_DEAD | payload={json.dumps(payload)[:200]}")
+                    write_log(f"QUEUE_DEAD | ticker={payload.get('ticker','?')} | payload={json.dumps(payload)[:200]}")
         else:
-            time.sleep(1)
+            time.sleep(0.1)  # Быстрее проверяем если очередь пуста
 
 
 # ══════════════════════════════════════════════════════════════════════════════
