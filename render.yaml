@@ -30,7 +30,7 @@ services:
       - key: TESTNET
         value: "false"       # false = реальная торговля
       - key: BYBIT_PAIRS
-        value: "EDGEUSDT,STOUSDT,FARTCOINUSDT,WLDUSDT"
+        value: "EDGEUSDT,STOUSDT,FARTCOINUSDT,WLDUSDT,ZBTUSDT"
 
       # ── BingX (ДЕМО) ──────────────────────────────────────────────
       - key: BINGX_API_KEY
@@ -40,7 +40,7 @@ services:
       - key: BINGX_DEMO
         value: "true"        # true = демо-счёт
       - key: BINGX_PAIRS
-        value: "ASTERUSDT,YBUSDT,UNIUSDT,SIRENUSDT"
+        value: "ASTERUSDT,YBUSDT,UNIUSDT,SIRENUSDT,BLESSUSDT"
 
       # ── Администраторы ────────────────────────────────────────────
       - key: ADMIN_IDS
