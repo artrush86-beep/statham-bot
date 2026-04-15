@@ -103,7 +103,7 @@ ADMIN_IDS = set(
 
 
 def _parse_pairs(env_key: str, fallback_key: str = "ALLOWED_PAIRS",
-                 default: str = "YBUSDT,ASTERUSDT,EDGEUSDT,STOUSDT") -> set[str]:
+                 default: str = "YBUSDT,ASTERUSDT,EDGEUSDT,STOUSDT,UNIUSDT,SIRENUSDT,FARTCOINUSDT,WLDUSDT,ZBTUSDT,BLESSUSDT") -> set[str]:
     raw = os.environ.get(env_key, "").strip()
     if not raw:
         raw = os.environ.get(fallback_key, default)
