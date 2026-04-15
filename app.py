@@ -416,14 +416,23 @@ def send_tg(text: str, thread_id=None, chat_id=None, reply_to=None) -> dict:
             )
             data = resp.json()
             if not data.get("ok"):
-                write_log(f"SEND_TG_FAIL | attempt={attempt} | {data.get('description')}")
-                time.sleep(2)
+                err_code = data.get("error_code", "?")
+                err_desc = data.get("description", "?")
+                write_log(f"SEND_TG_FAIL | attempt={attempt} | http={resp.status_code} code={err_code} desc={err_desc}")
+                # 429 = flood wait
+                if resp.status_code == 429:
+                    retry_after = data.get("parameters", {}).get("retry_after", 5)
+                    write_log(f"SEND_TG_FLOOD | retry_after={retry_after}s")
+                    time.sleep(retry_after)
+                else:
+                    time.sleep(2)
                 continue
             write_log(f"SEND_TG_OK | chat={chat_id} thread={thread_id}")
             return data["result"]
         except Exception as e:
-            write_log(f"SEND_TG_ERR | attempt={attempt} | {e}")
+            write_log(f"SEND_TG_ERR | attempt={attempt} | {type(e).__name__}: {e}")
             time.sleep(2)
+    write_log(f"SEND_TG_GIVE_UP | chat={chat_id} thread={thread_id} | all {3} attempts failed")
     return {}
 
 
@@ -533,9 +542,12 @@ def bybit_place_market(symbol: str, side: str, qty: float, reduce_only: bool = F
         qty=round_qty(symbol, qty),
         reduceOnly=reduce_only, timeInForce="IOC",
     )
-    write_log(f"BYBIT_MARKET | {symbol} {side} qty={qty} ro={reduce_only} | ret={resp['retCode']}")
-    if resp["retCode"] != 0:
-        raise Exception(f"Bybit {resp['retCode']}: {resp.get('retMsg','')}")
+    ret_code = resp['retCode']
+    ret_msg  = resp.get('retMsg', '')
+    order_id = (resp.get('result') or {}).get('orderId', '')
+    write_log(f"BYBIT_MARKET | {symbol} {side} qty={qty} ro={reduce_only} | ret={ret_code} msg={ret_msg} order={order_id}")
+    if ret_code != 0:
+        raise Exception(f"Bybit {ret_code}: {ret_msg}")
     return resp
 
 
@@ -626,6 +638,7 @@ def _bingx_req(method: str, path: str, params: dict | None = None) -> dict:
     data = resp.json()
     code = data.get("code", 0)
     if code != 0:
+        write_log(f"BINGX_API_ERR | {method} {path} | code={code} msg={data.get('msg','')} http={resp.status_code}")
         raise Exception(f"BingX error {code}: {data.get('msg', '')}")
     return data
 
@@ -911,14 +924,15 @@ def _highest_tp_hit(pos: dict | None) -> int:
     return max(hits, default=0)
 
 
-def update_stats(is_win: bool):
+def update_stats(result: str):
+    """result: 'win' | 'loss' | 'partial' (partial treated as loss for stats)."""
     with _state_lock:
         s = load_stats()
         s["total"] = s.get("total", 0) + 1
-        if is_win:
+        if result == "win":
             s["wins"] = s.get("wins", 0) + 1
         else:
-            s["losses"] = s.get("losses", 0) + 1
+            s["losses"] = s.get("losses", 0) + 1  # partial counts as loss
         save_stats(s)
 
 
@@ -1033,10 +1047,11 @@ def _wr_icon(wr: float) -> str:
 
 def _build_report(trades: list, title: str, show_last: int = 5,
                   show_top_tickers: bool = False, date_range: str = "") -> str:
-    wins    = [r for r in trades if r["result"] == "win"]
-    losses  = [r for r in trades if r["result"] == "loss"]
-    manuals = [r for r in trades if r["result"] == "manual"]
-    scored  = len(wins) + len(losses)
+    wins     = [r for r in trades if r["result"] == "win"]
+    losses   = [r for r in trades if r["result"] == "loss"]
+    partials = [r for r in trades if r["result"] == "partial"]
+    manuals  = [r for r in trades if r["result"] == "manual"]
+    scored   = len(wins) + len(losses) + len(partials)
     total   = len(trades)
     wr      = calc_winrate(len(wins), scored)
     avg_dur = int(sum(r.get("duration_sec", 0) for r in trades) / total) if total else 0
@@ -1055,7 +1070,7 @@ def _build_report(trades: list, title: str, show_last: int = 5,
 
     # ── Основные цифры ───────────────────────────────────────────────
     text += f"📊 Win Rate: <b>{_wr_icon(wr)} {wr}%</b>\n"
-    text += f"✅ TP: {len(wins)}   ❌ SL: {len(losses)}"
+    text += f"✅ TP: {len(wins)}   ❌ SL: {len(losses)}   🔶 Partial: {len(partials)}" if partials else f"✅ TP: {len(wins)}   ❌ SL: {len(losses)}"
     if manuals:
         text += f"   🧯 Manual: {len(manuals)}"
     text += f"\n📈 Всего закрыто: <b>{total}</b>\n"
@@ -1095,6 +1110,9 @@ def _build_report(trades: list, title: str, show_last: int = 5,
             if res == "win":
                 icon = "✅"
                 label = f"TP{tp_n}" if tp_n else "TP"
+            elif res == "partial":
+                icon = "🔶"
+                label = f"Partial TP{tp_n}" if tp_n else "Partial"
             elif res == "loss":
                 icon = "❌"
                 label = "SL"
@@ -1219,8 +1237,8 @@ def finalize_trade(payload: dict, trade_key: str | None, trade_data: dict | None
     if not _mark_trade_closed(instance_id, result, close_reason):
         write_log(f"FINALIZE_SKIP | {instance_id} already closed")
         return False
-    if result in ("win", "loss"):
-        update_stats(result == "win")
+    if result in ("win", "loss", "partial"):
+        update_stats(result)
     save_trade_to_history(payload, trade_data, result, tp_num, close_reason=close_reason, pos=pos)
     if actual_key:
         remove_trade(actual_key)
@@ -1244,7 +1262,7 @@ def handle_entry(payload: dict):
     with _pos_lock:
         existing_pos = load_positions().get(pkey)
     if existing_pos:
-        write_log(f"ENTRY_DUPLICATE_SKIP | {ticker} {direction} | active position exists")
+        write_log(f"ENTRY_SKIP | {ticker} {direction} | DUPLICATE — active position already exists for {pkey}")
         return
 
     source_msg = send_signals(text or f"📥 Вход {ticker} {direction}")
@@ -1265,8 +1283,14 @@ def handle_entry(payload: dict):
 
     # ── Хелпер: безопасный float из payload-поля ──────────────────────
     def _to_float(val) -> float | None:
+        """NaN / Inf / null / 'NaN' / пустые строки → None."""
         try:
-            return float(val) if val not in (None, "", "null") else None
+            if val is None or str(val).strip().lower() in ("", "null", "none", "nan", "undefined", "inf", "-inf"):
+                return None
+            f = float(val)
+            if math.isnan(f) or math.isinf(f):
+                return None
+            return f
         except Exception:
             return None
 
@@ -1458,6 +1482,7 @@ def handle_tp_hit(payload: dict):
     final_close = False
     pos_snapshot = None
     highest_tp = tp_num
+    _found_pos = True  # Bug 2 Fix flag
     with _pos_lock:
         positions = load_positions()
         pos = positions.get(pkey)
@@ -1465,8 +1490,10 @@ def handle_tp_hit(payload: dict):
             instance_id = _trade_instance_id(trade_key or key, trade, None, payload)
             if _trade_already_closed(instance_id):
                 write_log(f"TP_DUPLICATE_SKIP | {ticker} TP{tp_num} | already closed")
-            return
-        if pos.get(f"tp{tp_num}_hit"):
+                return  # genuine duplicate — skip silently
+            # Bug 2 Fix: position missing but NOT a duplicate → mark and fall through
+            _found_pos = False
+        elif pos.get(f"tp{tp_num}_hit"):
             write_log(f"TP_DUPLICATE_SKIP | {ticker} TP{tp_num} | already applied")
             return
 
@@ -1512,6 +1539,11 @@ def handle_tp_hit(payload: dict):
         pos_snapshot = dict(pos)
         save_positions(positions)
 
+    # Bug 2 Fix: if no position was found, still forward the signal to Telegram
+    if not _found_pos:
+        send_signals(text or f"✅ TP{tp_num} {ticker}", reply_to=reply_id)
+        return
+
     if trade_key:
         touch_trade(
             trade_key,
@@ -1539,6 +1571,7 @@ def handle_sl_hit(payload: dict):
     pkey = pos_key(ticker, direction)
     pos_snapshot = None
     highest_tp = 0
+    _found_pos_sl = True  # Bug 2 Fix flag
     with _pos_lock:
         positions = load_positions()
         pos = positions.get(pkey)
@@ -1546,17 +1579,32 @@ def handle_sl_hit(payload: dict):
             instance_id = _trade_instance_id(trade_key or key, trade, None, payload)
             if _trade_already_closed(instance_id):
                 write_log(f"SL_DUPLICATE_SKIP | {ticker} | already closed")
-            return
-        exchange = pos.get("exchange", "bybit")
-        highest_tp = _highest_tp_hit(pos)
-        pos_snapshot = dict(pos)
-        if exchange != "none":
-            ex_cancel_all(ticker, exchange)
-        positions.pop(pkey, None)
-        save_positions(positions)
+            _found_pos_sl = False
+        else:
+            exchange = pos.get("exchange", "bybit")
+            highest_tp = _highest_tp_hit(pos)
+            pos_snapshot = dict(pos)
+            if exchange != "none":
+                ex_cancel_all(ticker, exchange)
+            positions.pop(pkey, None)
+            save_positions(positions)
+
+    # Bug 2 Fix: always forward sl_hit to Telegram, even with no tracked position
+    if not _found_pos_sl:
+        send_signals(text or f"🛑 SL {ticker}")
+        return
+
     reply_id = (trade or {}).get("message_id") or pos_snapshot.get("message_id")
     send_signals(text or f"🛑 SL {ticker}", reply_to=reply_id)
-    result = "win" if highest_tp > 0 else "loss"
+    # FIX 5: For real-money exchange trades, partial TP + SL = "win" (profit taken).
+    # For telegram-only signals, no money was closed at TP, so SL = "loss" (or "partial" if any TP hit).
+    _exchange_sl = (pos_snapshot or {}).get("exchange", "bybit")
+    if highest_tp > 0 and _exchange_sl != "none":
+        result = "win"      # exchange: partial profit taken → still a win
+    elif highest_tp > 0 and _exchange_sl == "none":
+        result = "partial"  # telegram-only: TP was noted but SL hit = partial
+    else:
+        result = "loss"
     finalize_trade(payload, trade_key, trade, pos_snapshot, result, highest_tp, close_reason="sl_hit")
 
 
@@ -1686,9 +1734,32 @@ def process_signal(payload: dict):
         send_signals(text or json.dumps(payload, ensure_ascii=False))
 
 
+# Fast-lane events: process immediately in a thread, don't block the queue.
+# Entry signals go through the queue (need ordering, dedup). All others → fast lane.
+_FAST_LANE_EVENTS = {"tp_hit", "sl_hit", "sl_moved", "limit_order", "scale_in"}
+
+
 def enqueue_signal(payload: dict):
+    event = payload.get("event", "")
+    # FIX 8: non-entry events bypass the queue to avoid being blocked by long
+    # entry processing (e.g. UNIUSDT open taking 5s delays GPSUSDT tp_hit).
+    if event in _FAST_LANE_EVENTS:
+        threading.Thread(
+            target=_safe_process_signal,
+            args=(payload,),
+            daemon=True,
+            name=f"fast_{event}_{payload.get('ticker','?')}",
+        ).start()
+        return
     with _queue_lock:
         _signal_queue.append({"payload": payload, "attempts": 0, "queued_at": time.time()})
+
+
+def _safe_process_signal(payload: dict):
+    try:
+        process_signal(payload)
+    except Exception as e:
+        write_log(f"FAST_LANE_ERR | {payload.get('event','?')} {payload.get('ticker','?')} | {e}")
 
 
 def _queue_worker():
@@ -1960,7 +2031,10 @@ def _position_manager():
                 remaining = pos.get("remaining_qty", 0)
 
                 # Удаляем мёртвые позиции (нулевой объём или без биржи без trail)
-                if remaining <= 0 or (exchange == "none" and not pos.get("trail_active")):
+                # Bug 3 Fix: only remove positions with zero remaining qty.
+                # Previously exchange=="none" positions were removed immediately,
+                # causing tp_hit/sl_hit signals to have no position to match → lost stats.
+                if remaining <= 0:
                     with _pos_lock:
                         p2 = load_positions()
                         if pkey in p2:
@@ -2025,13 +2099,12 @@ def _keepalive():
 # ══════════════════════════════════════════════════════════════════════════════
 if bot:
     def _reply(m, text: str):
-        kw = {"parse_mode": "HTML", "disable_web_page_preview": True}
-        if getattr(m, "message_thread_id", None):
-            kw["message_thread_id"] = m.message_thread_id
-        try:
-            bot.send_message(m.chat.id, text, **kw)
-        except Exception as e:
-            write_log(f"REPLY_ERR | {e}")
+        # Bug 1 Fix: use send_tg() (3 retries, requests.post) instead of
+        # bot.send_message() which has no retry and fails on RemoteDisconnected.
+        thread_id = getattr(m, "message_thread_id", None)
+        result = send_tg(text, thread_id=thread_id, chat_id=str(m.chat.id))
+        if not result:
+            write_log(f"REPLY_ERR | send_tg returned empty for chat={m.chat.id}")
 
     @bot.message_handler(commands=["start"])
     def cmd_start(m):
@@ -2067,7 +2140,7 @@ if bot:
             "/reset_stats — сбросить статистику\n"
             "/cleanup — удалить зависшие сделки\n"
             "/clean — очистить trades+positions\n"
-            "/logs — последние строки лога"
+            "/logs — последние строки лога\n/diagnostics — проверка API и связей"
         ))
 
     @bot.message_handler(commands=["stats"])
@@ -2458,7 +2531,7 @@ def bybit_webhook():
     event  = payload.get("event", "")
     if event in ("entry", "smart_entry", "limit_hit") and ticker:
         if ALLOWED_PAIRS and ticker not in ALLOWED_PAIRS:
-            write_log(f"WEBHOOK_TELEGRAM_ONLY | {ticker} not in ALLOWED_PAIRS")
+            write_log(f"WEBHOOK_TELEGRAM_ONLY | {ticker} not in ALLOWED_PAIRS={sorted(ALLOWED_PAIRS)} — signal → Telegram only, no exchange execution")
 
     write_log(f"WEBHOOK | event={payload.get('event','?')} ticker={payload.get('ticker','?')}")
     enqueue_signal(payload)
@@ -2560,6 +2633,59 @@ def test_bingx_route():
     if not BINGX_AVAILABLE:
         return jsonify({"error": "BingX не настроен"}), 400
     return jsonify({"result": get_bingx_balance()})
+
+
+@app.route("/diagnostics")
+def diagnostics_route():
+    """Проверяет связь с Telegram, Bybit, BingX, Redis."""
+    result = {"time_utc": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")}
+
+    # Telegram
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getMe", timeout=8)
+        d = r.json()
+        result["telegram"] = {"ok": d.get("ok"), "bot": d.get("result", {}).get("username", "?")}
+    except Exception as e:
+        result["telegram"] = {"ok": False, "error": str(e)}
+
+    # Redis
+    try:
+        rc = _get_redis()
+        if rc:
+            rc.ping()
+            result["redis"] = {"ok": True, "keys": len(rc.keys(_REDIS_PREFIX + "*"))}
+        else:
+            result["redis"] = {"ok": False, "error": "not configured or connection failed"}
+    except Exception as e:
+        result["redis"] = {"ok": False, "error": str(e)}
+
+    # Bybit
+    if BYBIT_AVAILABLE:
+        try:
+            resp = bybit().get_server_time()
+            result["bybit"] = {"ok": resp["retCode"] == 0,
+                               "server_time": resp.get("result", {}).get("timeSecond", "?")}
+        except Exception as e:
+            result["bybit"] = {"ok": False, "error": str(e)}
+    else:
+        result["bybit"] = {"ok": False, "error": "not configured"}
+
+    # BingX
+    if BINGX_AVAILABLE:
+        try:
+            d = _bingx_req("GET", "/openApi/swap/v2/quote/ticker", {"symbol": "BTC-USDT"})
+            result["bingx"] = {"ok": True, "price": d.get("data", {}).get("lastPrice", "?")}
+        except Exception as e:
+            result["bingx"] = {"ok": False, "error": str(e)}
+    else:
+        result["bingx"] = {"ok": False, "error": "not configured"}
+
+    result["queue_len"]      = len(_signal_queue)
+    result["active_trades"]  = len(load_trades())
+    result["active_positions"] = len(load_positions())
+    result["emergency_stop"] = _emergency_stop.is_set()
+    write_log(f"DIAGNOSTICS | tg={result['telegram']['ok']} redis={result['redis']['ok']} bybit={result.get('bybit',{}).get('ok','n/a')} bingx={result.get('bingx',{}).get('ok','n/a')}")
+    return jsonify(result)
 
 
 @app.route("/redis_status")
