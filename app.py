@@ -133,19 +133,23 @@ _redis_client = None
 _REDIS_PREFIX  = "statham:"
 
 def _get_redis():
-    """Возвращает Redis-клиент или None если Redis недоступен."""
+    """Возвращает Redis-клиент или None если Redis недоступен.
+    При таймауте/ошибке инвалидирует клиент и пересоздаёт при следующем вызове."""
     global _redis_client
     if not _REDIS_AVAILABLE:
         return None
-    if _redis_client is not None:
-        return _redis_client
     url = os.environ.get("REDIS_URL", "").strip()
     if not url:
         return None
+    if _redis_client is not None:
+        return _redis_client
     try:
         client = _redis_lib.from_url(
             url, decode_responses=True,
-            socket_timeout=5, socket_connect_timeout=5,
+            # Upstash имеет cold-start до 2–3 сек; 10s timeout надёжнее
+            socket_timeout=10, socket_connect_timeout=10,
+            retry_on_timeout=True,
+            health_check_interval=30,
         )
         client.ping()
         _redis_client = client
@@ -153,6 +157,12 @@ def _get_redis():
     except Exception as e:
         log.warning(f"Redis | connect failed: {e}")
     return _redis_client
+
+
+def _redis_invalidate():
+    """Сбрасывает кешированный клиент — следующий вызов _get_redis() пересоздаст."""
+    global _redis_client
+    _redis_client = None
 
 def _rkey(path: str) -> str:
     """Преобразует путь к файлу в ключ Redis: /tmp/active_trades.json → statham:active_trades"""
@@ -285,6 +295,8 @@ def load_json(path: str, default):
                 return json.loads(val)
         except Exception as e:
             log.warning(f"REDIS_LOAD_ERR | {_rkey(path)} | {e}")
+            # Таймаут/обрыв → сбрасываем клиент; следующий вызов пересоздаст
+            _redis_invalidate()
     # 2) Фолбэк: файл
     if not os.path.exists(path):
         return default
@@ -306,6 +318,7 @@ def save_json(path: str, data):
             r.set(_rkey(path), serialized)
         except Exception as e:
             log.warning(f"REDIS_SAVE_ERR | {_rkey(path)} | {e}")
+            _redis_invalidate()
     # 2) Фолбэк: файл (атомарная запись)
     try:
         tmp = path + ".tmp"
@@ -1216,14 +1229,36 @@ def dedup_entry(ticker: str, direction: str, current_key: str = ""):
 
 
 def cleanup_old_trades() -> int:
+    """Удаляет: (1) сделки старше 7 дней, (2) сделки без соответствующей позиции старше 2 часов."""
     with _state_lock:
         trades = load_trades()
-        cutoff = int(time.time()) - 7 * 86400
-        removed = [k for k, v in trades.items() if v.get("created_at", 0) < cutoff]
+        positions = load_positions()
+        now = int(time.time())
+        cutoff_old   = now - 7 * 86400   # 7 дней
+        cutoff_orphan = now - 2 * 3600   # 2 часа
+
+        pos_keys_set = set()
+        for pkey, pos in positions.items():
+            # Позиция хранит trade_key
+            tk = pos.get("trade_key", "")
+            if tk:
+                pos_keys_set.add(tk)
+
+        removed = []
+        for k, v in list(trades.items()):
+            created = v.get("created_at", 0)
+            if created < cutoff_old:
+                removed.append(k)
+                continue
+            # Orphan: trade без активной позиции, висит > 2ч
+            if k not in pos_keys_set and created < cutoff_orphan:
+                removed.append(k)
+
         for k in removed:
             del trades[k]
         if removed:
             save_trades(trades)
+            write_log(f"CLEANUP | removed {len(removed)} stale/orphaned trades: {removed[:10]}")
         return len(removed)
 
 
@@ -1957,6 +1992,15 @@ def _scheduler():
                     _mark_sent(fg_key)
                     _check_fg(force=True)
 
+            # Авто-очистка зависших сделок каждые 6 часов
+            if h % 6 == 0 and 0 <= m <= 1:
+                auto_clean_key = f"auto_cleanup_{today}_{h:02d}"
+                if not _was_sent(auto_clean_key):
+                    _mark_sent(auto_clean_key)
+                    n = cleanup_old_trades()
+                    if n > 0:
+                        write_log(f"AUTO_CLEANUP | removed {n} orphaned trades")
+
             if h == 23 and 55 <= m <= 59:
                 key = f"daily_{today}"
                 if not _was_sent(key):
@@ -2140,7 +2184,7 @@ if bot:
             "/reset_stats — сбросить статистику\n"
             "/cleanup — удалить зависшие сделки\n"
             "/clean — очистить trades+positions\n"
-            "/logs — последние строки лога\n/diagnostics — проверка API и связей"
+            "/logs — последние строки лога\n/diagnostics — проверка всех API\n/redis_fix — переподключить Redis"
         ))
 
     @bot.message_handler(commands=["stats"])
@@ -2397,7 +2441,10 @@ if bot:
     def cmd_cleanup(m):
         if not is_admin_user(m.from_user.id):
             _reply(m, "❌ Только для администраторов."); return
-        _reply(m, f"🧹 Удалено {cleanup_old_trades()} зависших сделок.")
+        n = cleanup_old_trades()
+        trades_left = len(load_trades())
+        pos_left    = len(load_positions())
+        _reply(m, f"🧹 Удалено <b>{n}</b> зависших/устаревших сделок.\nОсталось: trades={trades_left}, positions={pos_left}")
 
     @bot.message_handler(commands=["clean"])
     def cmd_clean(m):
@@ -2405,6 +2452,66 @@ if bot:
             _reply(m, "❌ Только для администраторов."); return
         save_trades({}); save_positions({})
         _reply(m, "🧹 Активные сделки и позиции очищены.")
+
+    @bot.message_handler(commands=["diagnostics"])
+    def cmd_diagnostics(m):
+        if not is_admin_user(m.from_user.id):
+            _reply(m, "❌ Только для администраторов."); return
+        lines = ["🔧 <b>Диагностика API</b>\n"]
+        # Telegram
+        try:
+            r = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getMe", timeout=8)
+            d = r.json()
+            bot_name = d.get("result", {}).get("username", "?")
+            lines.append(f"{'✅' if d.get('ok') else '❌'} Telegram: @{bot_name}")
+        except Exception as e:
+            lines.append(f"❌ Telegram: {e}")
+        # Redis
+        try:
+            rc = _get_redis()
+            if rc:
+                rc.ping()
+                keys = rc.keys(_REDIS_PREFIX + "*")
+                lines.append(f"✅ Redis: {len(keys)} keys")
+            else:
+                lines.append("❌ Redis: не подключён")
+        except Exception as e:
+            _redis_invalidate()
+            lines.append(f"❌ Redis: {e}")
+        # Bybit
+        if BYBIT_AVAILABLE:
+            try:
+                resp = bybit().get_server_time()
+                lines.append(f"{'✅' if resp['retCode']==0 else '❌'} Bybit: server_time={resp.get('result',{}).get('timeSecond','?')}")
+            except Exception as e:
+                lines.append(f"❌ Bybit: {e}")
+        else:
+            lines.append("⚪ Bybit: не настроен")
+        # BingX
+        if BINGX_AVAILABLE:
+            try:
+                d = _bingx_req("GET", "/openApi/swap/v2/quote/ticker", {"symbol": "BTC-USDT"})
+                lines.append(f"✅ BingX: ok, BTC={d.get('data',{}).get('lastPrice','?')}")
+            except Exception as e:
+                lines.append(f"❌ BingX: {e}")
+        else:
+            lines.append("⚪ BingX: не настроен")
+        # Queue and state
+        lines.append(f"\n📊 Позиций: {len(load_positions())} | Сделок: {len(load_trades())}")
+        lines.append(f"📬 Очередь: {len(_signal_queue)} | 🛑 Стоп: {_emergency_stop.is_set()}")
+        _reply(m, "\n".join(lines))
+
+    @bot.message_handler(commands=["redis_fix"])
+    def cmd_redis_fix(m):
+        """Принудительно сбрасывает Redis-клиент и переподключается."""
+        if not is_admin_user(m.from_user.id):
+            _reply(m, "❌ Только для администраторов."); return
+        _redis_invalidate()
+        rc = _get_redis()
+        if rc:
+            _reply(m, "✅ Redis переподключён успешно.")
+        else:
+            _reply(m, "❌ Redis переподключение не удалось — проверь REDIS_URL.")
 
     @bot.message_handler(commands=["logs"])
     def cmd_logs(m):
@@ -2462,8 +2569,8 @@ def start_background_threads():
         threading.Thread(target=_scheduler, daemon=True, name="scheduler").start()
         threading.Thread(target=_keepalive, daemon=True, name="keepalive").start()
         threading.Thread(target=_register_bg, daemon=True, name="webhook_reg").start()
-        if BYBIT_AVAILABLE or BINGX_AVAILABLE:
-            threading.Thread(target=_position_manager, daemon=True, name="pos_mgr").start()
+        # Start position manager always — needed for telegram-only positions too
+        threading.Thread(target=_position_manager, daemon=True, name="pos_mgr").start()
         _bg_started = True
 
 
