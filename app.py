@@ -897,24 +897,64 @@ def place_tp_orders(ticker: str, side: str, opp_side: str, total_qty: float,
     Выставляет TP1–TP6 как ордера на бирже.
     tp_prices: {1: price, 2: price, ...}
     Возвращает: {1: order_id, 2: order_id, ...}
+
+    FIX 3: если qty для TP < min_qty, объём переносится на следующий TP (consolidation).
+    Это решает ErrCode 110017 (orderQty will be truncated to zero) на маленьких позициях.
     """
     order_ids: dict = {}
-    for tp_num, price in sorted(tp_prices.items()):
+    min_q = min_qty(ticker) if exchange == "bybit" else 0.001
+
+    # Строим список (tp_num, price, qty) с консолидацией слишком маленьких долей
+    pending_qty   = 0.0  # накопленный объём от пропущенных TP
+    pending_tp    = None  # номер первого пропущенного TP (для логирования)
+
+    sorted_tps = sorted(tp_prices.items())
+    plan: list[tuple[int, float, float]] = []
+
+    for tp_num, price in sorted_tps:
         pct = TP_CLOSE_PCT.get(tp_num, 0.0)
         if pct <= 0 or not price:
             continue
-        close_qty = round(total_qty * pct, 8)
+        raw_qty = round(total_qty * pct, 8)
+        qty_use = raw_qty + pending_qty  # добавляем накопленный из предыдущих мелких
+
+        if exchange == "bybit":
+            qty_use = float(round_qty(ticker, qty_use))
+        else:
+            qty_use = bingx_round_qty(qty_use)
+
+        if qty_use < min_q:
+            # Слишком мало — переносим на следующий TP
+            pending_qty += raw_qty
+            if pending_tp is None:
+                pending_tp = tp_num
+            write_log(f"TP_CONSOLIDATE | {ticker} TP{tp_num} | qty {qty_use:.4f} < min {min_q} → carry to next TP")
+            continue
+
+        plan.append((tp_num, price, qty_use))
+        pending_qty = 0.0
+        pending_tp  = None
+
+    # Если остался хвостовой pending_qty (последний TP тоже мал) — добавляем к последнему
+    if pending_qty > 0 and plan:
+        last_tp, last_price, last_qty = plan[-1]
+        extra = last_qty + pending_qty
+        if exchange == "bybit":
+            extra = float(round_qty(ticker, extra))
+        else:
+            extra = bingx_round_qty(extra)
+        plan[-1] = (last_tp, last_price, extra)
+        write_log(f"TP_TAIL_MERGE | {ticker} | pending {pending_qty:.4f} merged into TP{last_tp}")
+
+    # Размещаем ордера по плану
+    for tp_num, price, close_qty in plan:
         try:
             if exchange == "bybit":
-                min_q = min_qty(ticker)
-                if close_qty < min_q:
-                    write_log(f"TP_ORDER_SKIP | {ticker} TP{tp_num} | qty {close_qty} < min {min_q}")
-                    continue
                 resp = bybit_place_tp_limit(ticker, opp_side, close_qty, price)
                 if resp.get("retCode") == 0:
                     order_ids[tp_num] = resp["result"].get("orderId", "")
                 else:
-                    write_log(f"TP_ORDER_FAIL | {ticker} TP{tp_num} | {resp.get('retMsg','')}")
+                    write_log(f"TP_ORDER_FAIL | {ticker} TP{tp_num} | ret={resp.get('retCode')} {resp.get('retMsg','')}")
             elif exchange == "bingx":
                 bx_qty = bingx_round_qty(close_qty)
                 if bx_qty < 0.001:
@@ -924,7 +964,8 @@ def place_tp_orders(ticker: str, side: str, opp_side: str, total_qty: float,
         except Exception as e:
             write_log(f"TP_ORDER_ERR | {ticker} TP{tp_num} ({exchange}) | {e}")
         time.sleep(0.15)
-    write_log(f"TP_ORDERS_PLACED | {ticker} [{exchange}] | {order_ids}")
+
+    write_log(f"TP_ORDERS_PLACED | {ticker} [{exchange}] | plan={[(n,round(q,4)) for n,_,q in plan]} | orders={order_ids}")
     return order_ids
 def parse_price(text: str, *prefixes: str):
     for prefix in prefixes:
@@ -1510,11 +1551,11 @@ def handle_entry(payload: dict):
             use_exchange_tps = bool(tp_order_ids)
     else:
         write_log(f"ENTRY_TELEGRAM_ONLY | {ticker} {direction} | no exchange execution")
-        if price is None:
-            price = 0.0
-        # BUG 4 NOTE: if entry_price is None/NaN, Pine Script sent NaN in the alert.
-        # The signal text is forwarded as-is from Pine Script. No fix needed here —
-        # raw text (from `text` field) already contains the correct prices as formatted string.
+        # FIX: store the real entry price from Pine Script text — critical for P&L calc
+        # price may still be None if Pine Script sent NaN; keep as None (shown as "—")
+        # do NOT force 0.0 — that breaks calc_trade_pnl (divides by entry)
+        if price is not None and (math.isnan(price) if isinstance(price, float) else False):
+            price = None
 
     created_at = int(time.time())
     instance_id = _trade_instance_id(key, {
@@ -2273,10 +2314,94 @@ def _scheduler():
 # ══════════════════════════════════════════════════════════════════════════════
 # POSITION MANAGER (Trailing Stop)
 # ══════════════════════════════════════════════════════════════════════════════
+_last_exchange_sync = 0
+_EXCHANGE_SYNC_INTERVAL = 600  # 10 minutes
+
+
+def _sync_exchange_positions():
+    """
+    Сверяет tracked-позиции с реальными позициями на бирже.
+    Если позиция в боте есть, но на бирже её нет (phantom) — удаляет из Redis.
+    Это решает проблему STOUSDT DUPLICATE после редеплоя.
+    """
+    global _last_exchange_sync
+    now = time.time()
+    if now - _last_exchange_sync < _EXCHANGE_SYNC_INTERVAL:
+        return
+    _last_exchange_sync = now
+
+    with _pos_lock:
+        positions = dict(load_positions())
+
+    if not positions:
+        return
+
+    # ── Bybit sync ───────────────────────────────────────────────────────────
+    bybit_tracked = {pkey: pos for pkey, pos in positions.items()
+                     if pos.get("exchange") == "bybit"}
+    if bybit_tracked and BYBIT_AVAILABLE:
+        try:
+            resp = bybit().get_positions(category="linear", settleCoin="USDT")
+            live_symbols = {
+                p["symbol"] for p in resp.get("result", {}).get("list", [])
+                if float(p.get("size", 0)) > 0
+            }
+            phantoms = []
+            for pkey, pos in bybit_tracked.items():
+                symbol = pos.get("symbol", "")
+                if symbol and symbol not in live_symbols:
+                    phantoms.append(pkey)
+                    write_log(f"SYNC_PHANTOM | {pkey} | NOT on Bybit — removing from Redis")
+            if phantoms:
+                with _pos_lock:
+                    p2 = load_positions()
+                    for pkey in phantoms:
+                        p2.pop(pkey, None)
+                    save_positions(p2)
+                _phantom_list = "\n".join(f"• {pk}" for pk in phantoms)
+                send_signals(
+                    f"🔄 <b>Синхронизация позиций</b>\n"
+                    f"Удалено призрачных позиций: <b>{len(phantoms)}</b>\n"
+                    + _phantom_list
+                )
+        except Exception as e:
+            write_log(f"SYNC_BYBIT_ERR | {e}")
+
+    # ── BingX sync ──────────────────────────────────────────────────────────
+    bingx_tracked = {pkey: pos for pkey, pos in positions.items()
+                     if pos.get("exchange") == "bingx"}
+    if bingx_tracked and BINGX_AVAILABLE:
+        try:
+            data = _bingx_req("GET", "/openApi/swap/v2/user/positions", {})
+            live_bingx = set()
+            for p in (data.get("data") or []):
+                sym = p.get("symbol", "").replace("-", "")
+                if float(p.get("positionAmt", 0) or 0) != 0:
+                    live_bingx.add(sym)
+            phantoms_bx = []
+            for pkey, pos in bingx_tracked.items():
+                symbol = pos.get("symbol", "")
+                bx_sym = _bingx_to_symbol(symbol).replace("-", "")
+                if symbol and bx_sym not in live_bingx:
+                    phantoms_bx.append(pkey)
+                    write_log(f"SYNC_PHANTOM_BINGX | {pkey} | NOT on BingX — removing")
+            if phantoms_bx:
+                with _pos_lock:
+                    p2 = load_positions()
+                    for pkey in phantoms_bx:
+                        p2.pop(pkey, None)
+                    save_positions(p2)
+        except Exception as e:
+            write_log(f"SYNC_BINGX_ERR | {e}")
+
+
 def _position_manager():
     write_log("POSITION_MANAGER | start")
     while True:
         try:
+            # Периодическая сверка с биржами (каждые 10 минут)
+            _sync_exchange_positions()
+
             with _pos_lock:
                 snapshot = dict(load_positions())
 
@@ -2394,7 +2519,7 @@ if bot:
             "/reset_stats — сбросить статистику\n"
             "/cleanup — удалить зависшие сделки\n"
             "/clean — очистить trades+positions\n"
-            "/logs — последние строки лога\n/diagnostics — проверка всех API\n/redis_fix — переподключить Redis"
+            "/logs — последние строки лога\n/diagnostics — проверка всех API\n/redis_fix — переподключить Redis\n/sync — сверить позиции с биржами"
         ))
 
     @bot.message_handler(commands=["stats"])
@@ -2717,6 +2842,23 @@ if bot:
         lines.append(f"\n📊 Позиций: {len(load_positions())} | Сделок: {len(load_trades())}")
         lines.append(f"📬 Очередь: {len(_signal_queue)} | 🛑 Стоп: {_emergency_stop.is_set()}")
         _reply(m, "\n".join(lines))
+
+    @bot.message_handler(commands=["sync"])
+    def cmd_sync(m):
+        """Принудительная сверка позиций бота с биржами."""
+        if not is_admin_user(m.from_user.id):
+            _reply(m, "❌ Только для администраторов."); return
+        global _last_exchange_sync
+        _last_exchange_sync = 0  # сброс таймера → sync запустится немедленно
+        before = len(load_positions())
+        _sync_exchange_positions()
+        after = len(load_positions())
+        removed = before - after
+        _reply(m, (
+            f"🔄 <b>Синхронизация завершена</b>\n"
+            f"Позиций до: {before} | После: {after}\n"
+            f"Удалено призрачных: <b>{removed}</b>"
+        ))
 
     @bot.message_handler(commands=["redis_fix"])
     def cmd_redis_fix(m):
