@@ -125,6 +125,82 @@ except Exception:
 
 TP_CLOSE_PCT = {1: 0.25, 2: 0.20, 3: 0.25, 4: 0.15, 5: 0.10, 6: 0.05}
 
+
+def calc_trade_pnl(pos: dict, sl_exit_price: float | None = None) -> dict:
+    """
+    Рассчитывает реализованный P&L с учётом частичных TP-закрытий и SL-выхода.
+
+    Логика:
+      - Для каждого tp{n}_hit: закрыта доля TP_CLOSE_PCT[n] от total_qty по tp{n}_price
+      - Остаток (remaining_qty) закрыт по sl_exit_price
+      - direction BUY:  profit% = (exit - entry) / entry × leverage
+      - direction SELL: profit% = (entry - exit) / entry × leverage
+
+    Возвращает dict: {
+        "pnl_pct": float,          # итоговый P&L в % (с учётом плеча)
+        "pnl_pct_no_lev": float,   # P&L без плеча (raw move)
+        "tp_pnl_pct": float,       # P&L только от TP-частей
+        "sl_pnl_pct": float,       # P&L от SL-остатка
+        "highest_tp": int,
+        "tps_hit": list[int],
+        "remaining_pct": float,    # доля позиции, закрытая на SL (0–1)
+        "closed_on_tp_pct": float, # доля, закрытая на TP (0–1)
+    }
+    """
+    entry  = float(pos.get("entry_price") or 0)
+    lev    = float(pos.get("leverage") or 1)
+    dirn   = str(pos.get("direction") or "BUY").upper()
+    total  = float(pos.get("total_qty") or 1)
+
+    if entry <= 0:
+        return {"pnl_pct": 0.0, "pnl_pct_no_lev": 0.0,
+                "tp_pnl_pct": 0.0, "sl_pnl_pct": 0.0,
+                "highest_tp": 0, "tps_hit": [],
+                "remaining_pct": 0.0, "closed_on_tp_pct": 0.0}
+
+    tps_hit: list[int] = []
+    closed_pct   = 0.0   # доля позиции, закрытая на TP (0–1)
+    tp_pnl_pct   = 0.0   # накопленный P&L от TP-закрытий (без плеча)
+
+    for n in range(1, 7):
+        if not pos.get(f"tp{n}_hit"):
+            continue
+        tp_price = float(pos.get(f"tp{n}_price") or 0)
+        if tp_price <= 0:
+            continue
+        share = TP_CLOSE_PCT.get(n, 0.0)
+        if dirn == "BUY":
+            move = (tp_price - entry) / entry
+        else:
+            move = (entry - tp_price) / entry
+        tp_pnl_pct += move * share
+        closed_pct  += share
+        tps_hit.append(n)
+
+    remaining_pct = max(0.0, 1.0 - closed_pct)
+    sl_pnl_pct    = 0.0
+
+    if sl_exit_price and sl_exit_price > 0 and remaining_pct > 0:
+        if dirn == "BUY":
+            sl_move = (sl_exit_price - entry) / entry
+        else:
+            sl_move = (entry - sl_exit_price) / entry
+        sl_pnl_pct = sl_move * remaining_pct
+
+    total_no_lev = tp_pnl_pct + sl_pnl_pct
+    total_with_lev = total_no_lev * lev
+
+    return {
+        "pnl_pct":          round(total_with_lev * 100, 2),
+        "pnl_pct_no_lev":   round(total_no_lev  * 100, 2),
+        "tp_pnl_pct":       round(tp_pnl_pct    * 100, 2),
+        "sl_pnl_pct":       round(sl_pnl_pct    * 100, 2),
+        "highest_tp":       max(tps_hit, default=0),
+        "tps_hit":          tps_hit,
+        "remaining_pct":    round(remaining_pct * 100, 1),
+        "closed_on_tp_pct": round(closed_pct    * 100, 1),
+    }
+
 DATA_DIR = os.environ.get("DATA_DIR", "/tmp")
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -1018,6 +1094,7 @@ def save_trade_to_history(payload: dict, trade_data: dict | None, result: str, t
         "close_reason": close_reason or payload.get("event", ""),
         "date_msk": _msk().strftime("%Y-%m-%d"),
         "week_msk": f"{_msk().year}-W{_msk().isocalendar()[1]:02d}",
+        "pnl": payload.get("_bot_pnl", {}),
     }
     with _state_lock:
         history = load_history()
@@ -1088,6 +1165,9 @@ def _build_report(trades: list, title: str, show_last: int = 5,
         text += f"   🧯 Manual: {len(manuals)}"
     text += f"\n📈 Всего закрыто: <b>{total}</b>\n"
     text += f"⏱ Ср. время: {fmt_duration(avg_dur)}\n"
+    if avg_pnl is not None:
+        _pnl_sign = "+" if avg_pnl >= 0 else ""
+        text += f"💰 Ср. П&Л: <b>{_pnl_sign}{avg_pnl}%</b> (с плечом)\n"
 
     # ── Разбивка по TP ───────────────────────────────────────────────
     if tp_counts:
@@ -1586,9 +1666,27 @@ def handle_tp_hit(payload: dict):
             remaining_qty=pos_snapshot.get("remaining_qty"),
             trail_active=pos_snapshot.get("trail_active", False),
         )
-    send_signals(text or f"✅ TP{tp_num} {ticker}", reply_to=reply_id or pos_snapshot.get("message_id"))
     if final_close:
+        # Position fully closed at TP6 (or remaining ≤ min_qty)
+        pnl = calc_trade_pnl(pos_snapshot, None)
+        _entry_fc = pos_snapshot.get("entry_price", 0)
+        _dirn_fc  = pos_snapshot.get("direction", "?")
+        _lev_fc   = pos_snapshot.get("leverage", 1)
+        _tps_str  = " → ".join(f"TP{n}" for n in pnl["tps_hit"])
+        _pnl_sign = "+" if pnl["pnl_pct"] >= 0 else ""
+        tp_close_msg = (
+            f"🏆 <b>ПОЗИЦИЯ ЗАКРЫТА ПОЛНОСТЬЮ</b>\n"
+            f"━━━━━━━\n"
+            f"#{ticker} {_dirn_fc} — TP{tp_num}\n"
+            f"📊 Закрыто: {_tps_str}\n"
+            f"📈 <b>П&Л (бот): {_pnl_sign}{pnl['pnl_pct']}%</b>"
+            f"  <i>(без плеча: {_pnl_sign}{pnl['pnl_pct_no_lev']}%)</i>"
+        )
+        send_signals(tp_close_msg, reply_to=reply_id or pos_snapshot.get("message_id"))
+        payload["_bot_pnl"] = pnl
         finalize_trade(payload, trade_key, trade, pos_snapshot, "win", highest_tp, close_reason=f"tp_hit_{tp_num}")
+    else:
+        send_signals(text or f"✅ TP{tp_num} {ticker}", reply_to=reply_id or pos_snapshot.get("message_id"))
 
 
 def handle_sl_hit(payload: dict):
@@ -1630,16 +1728,72 @@ def handle_sl_hit(payload: dict):
         return
 
     reply_id = (trade or {}).get("message_id") or pos_snapshot.get("message_id")
-    send_signals(text or f"🛑 SL {ticker}", reply_to=reply_id)
-    # FIX 5: For real-money exchange trades, partial TP + SL = "win" (profit taken).
-    # For telegram-only signals, no money was closed at TP, so SL = "loss" (or "partial" if any TP hit).
-    _exchange_sl = (pos_snapshot or {}).get("exchange", "bybit")
+
+    # ── Рассчитываем реальный P&L в боте (не доверяем Pine Script +0%) ──────
+    sl_exit_price = None
+    if text:
+        sl_exit_price = parse_price(text, "Цена выхода:", "💰 Цена выхода:")
+    pnl = calc_trade_pnl(pos_snapshot, sl_exit_price)
+    _exchange_sl  = pos_snapshot.get("exchange", "bybit")
+    _lev          = pos_snapshot.get("leverage", 1)
+    _dirn         = pos_snapshot.get("direction", "?")
+    _entry        = pos_snapshot.get("entry_price", 0)
+    _tps_hit_list = pnl["tps_hit"]
+
+    # Формируем обогащённое сообщение (заменяем текст индикатора нашим)
+    if _tps_hit_list:
+        _tp_str = " → ".join(f"TP{n}" for n in _tps_hit_list)
+        _res_label = f"✅ Частичная прибыль ({_tp_str})"
+    else:
+        _res_label = "❌ Чистый убыток"
+
+    _pnl_sign = "+" if pnl["pnl_pct"] >= 0 else ""
+    _pnl_color = "📈" if pnl["pnl_pct"] >= 0 else "📉"
+
+    # Длительность (из trade_data)
+    _dur_str = ""
+    _created = (trade or {}).get("created_at") or pos_snapshot.get("created_at")
+    if _created:
+        _dur_sec = int(time.time()) - int(_created)
+        _dur_str = f"\n⏱ Время в сделке: {fmt_duration(_dur_sec)}"
+
+    _exch_label = ""
+    if _exchange_sl != "none":
+        _demo_flag = "🧪DEMO" if (_exchange_sl == "bingx" and BINGX_DEMO) else ("🧪TEST" if TESTNET else "🔴LIVE")
+        _exch_label = f" [{_exchange_sl.upper()} {_demo_flag}]"
+
+    _tp_part_sign = "+" if pnl["tp_pnl_pct"] >= 0 else ""
+    _sl_part_sign = "+" if pnl["sl_pnl_pct"] >= 0 else ""
+    bot_msg = (
+        f"🛑 <b>СТОП ВЫБИТ</b>{_exch_label}\n"
+        f"━━━━━━━\n"
+        f"#{ticker} {_dirn}"
+        f"{_dur_str}\n"
+        f"📍 Вход: {_entry}  |  SL-выход: {sl_exit_price or chr(8212)}\n"
+        f"📊 {_res_label}\n"
+        f"{_pnl_color} <b>П&amp;Л (бот): {_pnl_sign}{pnl['pnl_pct']}%</b>"
+        f"  <i>(без плеча: {_pnl_sign}{pnl['pnl_pct_no_lev']}%)</i>\n"
+        f"  TP-часть: {_tp_part_sign}{pnl['tp_pnl_pct']}%"
+        f"  |  SL-остаток: {_sl_part_sign}{pnl['sl_pnl_pct']}%"
+        f"  ({pnl['remaining_pct']}% позиции)"
+    )
+
+    # Отправляем НАШЕ сообщение (точный P&L), потом текст из Pine Script если есть
+    send_signals(bot_msg, reply_to=reply_id)
+    if text and text.strip() != bot_msg.strip():
+        # Пересылаем оригинальный текст Pine Script для сравнения
+        write_log(f"SL_HIT_PINESCRIPT_TEXT | {ticker} | {text[:120]}")
+
+    # FIX 5: result type
     if highest_tp > 0 and _exchange_sl != "none":
-        result = "win"      # exchange: partial profit taken → still a win
+        result = "win"
     elif highest_tp > 0 and _exchange_sl == "none":
-        result = "partial"  # telegram-only: TP was noted but SL hit = partial
+        result = "partial"
     else:
         result = "loss"
+
+    # Store pnl in finalize payload
+    payload["_bot_pnl"] = pnl
     finalize_trade(payload, trade_key, trade, pos_snapshot, result, highest_tp, close_reason="sl_hit")
 
 
@@ -2198,12 +2352,19 @@ if bot:
         history = load_history()
         tp3plus = sum(1 for r in history if r.get("result") == "win"
                       and int(r.get("tp_num") or 0) >= 3)
+        pnl_vals = [r["pnl"].get("pnl_pct", 0) for r in history if r.get("pnl")]
+        avg_pnl_all = round(sum(pnl_vals) / len(pnl_vals), 2) if pnl_vals else None
+        pnl_line = ""
+        if avg_pnl_all is not None:
+            _s = "+" if avg_pnl_all >= 0 else ""
+            pnl_line = f"\n💰 Ср. П&Л на сделку: <b>{_s}{avg_pnl_all}%</b>"
         _reply(m, (
             f"📊 <b>Статистика Statham Strategy</b>\n\n"
             f"{_wr_icon(wr)} Win Rate: <b>{wr}%</b>\n"
             f"✅ TP (≥TP3): {tp3plus}   ✅ TP всего: {wins}\n"
             f"❌ SL: {losses}\n"
             f"📈 Всего закрыто: <b>{total}</b>"
+            f"{pnl_line}"
         ))
 
     @bot.message_handler(commands=["daily_report"])
