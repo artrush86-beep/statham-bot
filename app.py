@@ -1144,7 +1144,13 @@ def _build_report(trades: list, title: str, show_last: int = 5,
     scored   = len(wins) + len(losses) + len(partials)
     total   = len(trades)
     wr      = calc_winrate(len(wins), scored)
+    if not trades:
+        return f"{title}\n\n<i>Нет данных за период.</i>"
     avg_dur = int(sum(r.get("duration_sec", 0) for r in trades) / total) if total else 0
+
+    # Средний P&L из сохранённых расчётов бота
+    pnl_values = [r["pnl"].get("pnl_pct", 0) for r in trades if r.get("pnl")]
+    avg_pnl = round(sum(pnl_values) / len(pnl_values), 2) if pnl_values else None
 
     tp_counts: dict = {}
     for r in wins:
@@ -1378,6 +1384,10 @@ def handle_entry(payload: dict):
         existing_pos = load_positions().get(pkey)
     if existing_pos:
         write_log(f"ENTRY_SKIP | {ticker} {direction} | DUPLICATE — active position already exists for {pkey}")
+        # BUG 2 FIX: still forward the signal text to Telegram even on duplicate
+        # (trader needs to see every signal; exchange execution is skipped)
+        _dup_text = text or f"⚠️ Дубль сигнала #{ticker} {direction} — позиция уже открыта"
+        send_signals(_dup_text)
         return
 
     source_msg = send_signals(text or f"📥 Вход {ticker} {direction}")
@@ -1419,7 +1429,28 @@ def handle_entry(payload: dict):
     tp6_price = parse_price(text, "TP6:", "✅ TP6:") or _to_float(payload.get("tp6"))
 
     # ── Цена входа: из текста, затем из JSON-поля entry_price ────────
+    # Pine Script sometimes sends NaN in entry_price JSON field — text has the real value
     price = infer_entry_price(text) or _to_float(payload.get("entry_price"))
+    # Additional fallback: try common Pine Script text patterns
+    if price is None and text:
+        price = (parse_price(text, "📍 Вход:", "Вход:") or
+                 parse_price(text, "🎯 Вход:", "Entry:") or
+                 parse_price(text, "Price:", "Цена:"))
+    # Parse SL/TP from text with additional patterns if JSON was null
+    if sl_price is None and text:
+        sl_price = parse_price(text, "SL:", "⛔ SL:", "Stop:", "Стоп:")
+    if tp1_price is None and text:
+        tp1_price = parse_price(text, "TP1:", "TP 1:", "✅ TP1:", "Take 1:")
+    if tp2_price is None and text:
+        tp2_price = parse_price(text, "TP2:", "TP 2:", "✅ TP2:", "Take 2:")
+    if tp3_price is None and text:
+        tp3_price = parse_price(text, "TP3:", "TP 3:", "✅ TP3:")
+    if tp4_price is None and text:
+        tp4_price = parse_price(text, "TP4:", "TP 4:", "✅ TP4:")
+    if tp5_price is None and text:
+        tp5_price = parse_price(text, "TP5:", "TP 5:", "✅ TP5:")
+    if tp6_price is None and text:
+        tp6_price = parse_price(text, "TP6:", "TP 6:", "✅ TP6:")
 
     # ── Диагностика — видно что распарсилось ──────────────────────────
     write_log(f"PARSED | {ticker} entry={price} sl={sl_price} "
@@ -1481,6 +1512,9 @@ def handle_entry(payload: dict):
         write_log(f"ENTRY_TELEGRAM_ONLY | {ticker} {direction} | no exchange execution")
         if price is None:
             price = 0.0
+        # BUG 4 NOTE: if entry_price is None/NaN, Pine Script sent NaN in the alert.
+        # The signal text is forwarded as-is from Pine Script. No fix needed here —
+        # raw text (from `text` field) already contains the correct prices as formatted string.
 
     created_at = int(time.time())
     instance_id = _trade_instance_id(key, {
@@ -1730,9 +1764,31 @@ def handle_sl_hit(payload: dict):
     reply_id = (trade or {}).get("message_id") or pos_snapshot.get("message_id")
 
     # ── Рассчитываем реальный P&L в боте (не доверяем Pine Script +0%) ──────
+    # BUG 3 FIX: Pine Script nulls all price fields in sl_hit alert — we use pos_snapshot
+    # (loaded from Redis) which always has entry_price, leverage, tp prices etc.
+    # sl_exit_price is extracted from Pine Script text, or from payload "exit_price" field.
     sl_exit_price = None
     if text:
-        sl_exit_price = parse_price(text, "Цена выхода:", "💰 Цена выхода:")
+        sl_exit_price = (
+            parse_price(text, "Цена выхода:", "💰 Цена выхода:")
+            or parse_price(text, "Exit:", "exit:")
+            or parse_price(text, "Price:", "price:")
+        )
+    # Also check JSON payload for exit_price field
+    if not sl_exit_price:
+        try:
+            _ep = payload.get("exit_price") or payload.get("close_price")
+            if _ep and str(_ep).lower() not in ("null", "none", "nan", ""):
+                sl_exit_price = float(_ep)
+        except Exception:
+            pass
+    # If still missing, use sl_price from position as approximation
+    if not sl_exit_price and pos_snapshot:
+        _sl_approx = pos_snapshot.get("sl_price") or pos_snapshot.get("trail_sl")
+        if _sl_approx:
+            sl_exit_price = float(_sl_approx)
+            write_log(f"SL_EXIT_APPROX | {ticker} | using stored sl_price={sl_exit_price}")
+    write_log(f"PNL_CALC | {ticker} | entry={pos_snapshot.get('entry_price')} sl_exit={sl_exit_price} lev={pos_snapshot.get('leverage')}")
     pnl = calc_trade_pnl(pos_snapshot, sl_exit_price)
     _exchange_sl  = pos_snapshot.get("exchange", "bybit")
     _lev          = pos_snapshot.get("leverage", 1)
