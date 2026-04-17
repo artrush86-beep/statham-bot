@@ -1118,6 +1118,8 @@ def save_trade_to_history(payload: dict, trade_data: dict | None, result: str, t
         "sl_price": pos.get("sl_price", trade_data.get("sl_price")),
         "total_qty": pos.get("total_qty", trade_data.get("total_qty")),
         "remaining_qty": pos.get("remaining_qty", trade_data.get("remaining_qty")),
+        # highest_tp_hit = best TP reached during trade lifetime
+        # tp_num = the TP that CLOSED the position (6 for full close, 0 for SL)
         "highest_tp_hit": max(tp_num, _highest_tp_hit(pos)),
         "entry_time": entry_time,
         "close_time": now,
@@ -1185,11 +1187,23 @@ def _build_report(trades: list, title: str, show_last: int = 5,
     pnl_values = [r["pnl"].get("pnl_pct", 0) for r in trades if r.get("pnl")]
     avg_pnl = round(sum(pnl_values) / len(pnl_values), 2) if pnl_values else None
 
-    tp_counts: dict = {}
-    for r in wins:
-        n = int(r.get("tp_num") or 0)
+    # ── Разбивка по TP: считаем highest_tp_hit для всех закрытых сделок ─
+    # "wins" (TP6/remaining=0) и "partials" (SL после TP1-N) — обе считаются
+    tp_counts: dict = {}      # {tp_num: count}
+    tp_pnl_sums: dict = {}    # {tp_num: [pnl_pct, ...]}
+    for r in wins + partials:
+        # highest_tp_hit — максимальный достигнутый TP (для partial это TP1-5)
+        n = int(r.get("highest_tp_hit") or r.get("tp_num") or 0)
         if n:
             tp_counts[n] = tp_counts.get(n, 0) + 1
+        # Collect P&L by highest TP
+        pnl_data = r.get("pnl", {})
+        if pnl_data and n:
+            if n not in tp_pnl_sums:
+                tp_pnl_sums[n] = []
+            tp_pnl_sums[n].append(pnl_data.get("pnl_pct", 0))
+    # Also count pure SL losses (no TP hit) as TP0
+    sl_only = [r for r in losses if not (r.get("highest_tp_hit") or r.get("tp_num"))]
 
     # ── Заголовок ────────────────────────────────────────────────────
     text = f"{title}\n"
@@ -1208,12 +1222,26 @@ def _build_report(trades: list, title: str, show_last: int = 5,
         _pnl_sign = "+" if avg_pnl >= 0 else ""
         text += f"💰 Ср. П&Л: <b>{_pnl_sign}{avg_pnl}%</b> (с плечом)\n"
 
-    # ── Разбивка по TP ───────────────────────────────────────────────
+    # ── Разбивка по TP — количество + средний P&L ───────────────────
     if tp_counts:
-        text += "\n<b>Разбивка по TP:</b>\n"
-        for n, cnt in sorted(tp_counts.items()):
-            bar = "█" * cnt
-            text += f"  TP{n}: {cnt} ✅  <code>{bar}</code>\n"
+        text += "\n<b>📊 Разбивка по TP (включая Partial):</b>\n"
+        for n in sorted(tp_counts.keys()):
+            cnt = tp_counts[n]
+            bar = "█" * min(cnt, 20)
+            pnl_list = tp_pnl_sums.get(n, [])
+            if pnl_list:
+                avg_tp_pnl = round(sum(pnl_list) / len(pnl_list), 1)
+                _s = "+" if avg_tp_pnl >= 0 else ""
+                pnl_str = f"  <i>avg {_s}{avg_tp_pnl}%</i>"
+            else:
+                pnl_str = ""
+            text += f"  TP{n}: {cnt}x  <code>{bar}</code>{pnl_str}\n"
+    # ── Чистые SL (без TP) ───────────────────────────────────────────
+    if sl_only:
+        sl_pnl_list = [r.get("pnl", {}).get("pnl_pct", 0) for r in sl_only if r.get("pnl")]
+        if sl_pnl_list:
+            avg_sl_pnl = round(sum(sl_pnl_list) / len(sl_pnl_list), 1)
+            text += f"  SL (чистый): {len(sl_only)}x  <i>avg {avg_sl_pnl}%</i>\n"
 
     # ── Топ тикеры (для недельного/месячного) ────────────────────────
     if show_top_tickers and total > 0:
@@ -2510,7 +2538,7 @@ if bot:
             "/reset_stats — сбросить статистику\n"
             "/cleanup — удалить зависшие сделки\n"
             "/clean — очистить trades+positions\n"
-            "/logs — последние строки лога\n/diagnostics — проверка всех API\n/redis_fix — переподключить Redis\n/sync — сверить позиции с биржами"
+            "/logs — последние строки лога\n/diagnostics — проверка всех API\n/redis_fix — переподключить Redis\n/redis_info — статус Redis + ключи\n/redis_clear_history — очистить историю\n/redis_clear_all — очистить всё Redis\n/sync — сверить позиции с биржами"
         ))
 
     @bot.message_handler(commands=["stats"])
@@ -2530,13 +2558,28 @@ if bot:
         if avg_pnl_all is not None:
             _s = "+" if avg_pnl_all >= 0 else ""
             pnl_line = f"\n💰 Ср. П&Л на сделку: <b>{_s}{avg_pnl_all}%</b>"
+        # TP breakdown for all time
+        _partials_all = [r for r in history if r.get("result") == "partial"]
+        _wins_all     = [r for r in history if r.get("result") == "win"]
+        _tp_all: dict = {}
+        for r in _wins_all + _partials_all:
+            n = int(r.get("highest_tp_hit") or r.get("tp_num") or 0)
+            if n:
+                _tp_all[n] = _tp_all.get(n, 0) + 1
+        tp_breakdown = ""
+        if _tp_all:
+            tp_breakdown = "\n\n<b>Разбивка по TP:</b>\n"
+            for n in sorted(_tp_all.keys()):
+                tp_breakdown += f"  TP{n}: {_tp_all[n]}x\n"
         _reply(m, (
             f"📊 <b>Статистика Statham Strategy</b>\n\n"
             f"{_wr_icon(wr)} Win Rate: <b>{wr}%</b>\n"
             f"✅ TP (≥TP3): {tp3plus}   ✅ TP всего: {wins}\n"
-            f"❌ SL: {losses}\n"
+            f"🔶 Partial (TP+SL): {len(_partials_all)}\n"
+            f"❌ SL чистый: {losses}\n"
             f"📈 Всего закрыто: <b>{total}</b>"
             f"{pnl_line}"
+            f"{tp_breakdown}"
         ))
 
     @bot.message_handler(commands=["daily_report"])
@@ -2862,6 +2905,75 @@ if bot:
             _reply(m, "✅ Redis переподключён успешно.")
         else:
             _reply(m, "❌ Redis переподключение не удалось — проверь REDIS_URL.")
+
+    @bot.message_handler(commands=["redis_info"])
+    def cmd_redis_info(m):
+        """Показывает статус Redis, список ключей и размеры данных."""
+        if not is_admin_user(m.from_user.id):
+            _reply(m, "❌ Только для администраторов."); return
+        rc = _get_redis()
+        if rc is None:
+            _reply(m, "❌ Redis не подключён."); return
+        try:
+            rc.ping()
+            keys = rc.keys(_REDIS_PREFIX + "*")
+            lines = [f"✅ <b>Redis подключён</b>\n"]
+            lines.append(f"🔑 Ключей: <b>{len(keys)}</b>\n")
+            total_bytes = 0
+            for k in sorted(keys):
+                val = rc.get(k) or ""
+                size = len(val)
+                total_bytes += size
+                # Parse counts
+                try:
+                    parsed = json.loads(val)
+                    if isinstance(parsed, dict):
+                        count = len(parsed)
+                    elif isinstance(parsed, list):
+                        count = len(parsed)
+                    else:
+                        count = 1
+                    lines.append(f"  <code>{k.replace(_REDIS_PREFIX,'')}</code>: {count} записей ({size//1024 if size>1024 else size}{'KB' if size>1024 else 'B'})")
+                except Exception:
+                    lines.append(f"  <code>{k.replace(_REDIS_PREFIX,'')}</code>: {size}B")
+            lines.append(f"\n💾 Всего данных: {total_bytes//1024}KB")
+            _reply(m, "\n".join(lines))
+        except Exception as e:
+            _redis_invalidate()
+            _reply(m, f"❌ Redis ошибка: {e}")
+
+    @bot.message_handler(commands=["redis_clear_history"])
+    def cmd_redis_clear_history(m):
+        """Очищает только историю сделок (не статистику и не позиции)."""
+        if not is_admin_user(m.from_user.id):
+            _reply(m, "❌ Только для администраторов."); return
+        rc = _get_redis()
+        count = len(load_history())
+        save_history([])
+        _reply(m, f"🗑 История очищена. Было записей: <b>{count}</b>.\nСтатистика и позиции сохранены.")
+
+    @bot.message_handler(commands=["redis_clear_all"])
+    def cmd_redis_clear_all(m):
+        """ПОЛНАЯ очистка Redis (все данные бота). Требует подтверждения."""
+        if not is_admin_user(m.from_user.id):
+            _reply(m, "❌ Только для администраторов."); return
+        rc = _get_redis()
+        if rc is None:
+            _reply(m, "❌ Redis не подключён."); return
+        try:
+            keys = rc.keys(_REDIS_PREFIX + "*")
+            if not keys:
+                _reply(m, "ℹ️ Redis уже пуст."); return
+            for k in keys:
+                rc.delete(k)
+            # Also reset in-memory
+            save_stats({"wins": 0, "losses": 0, "total": 0})
+            save_trades({})
+            save_positions({})
+            save_history([])
+            _reply(m, f"🗑 <b>Redis полностью очищен.</b>\nУдалено ключей: {len(keys)}")
+        except Exception as e:
+            _reply(m, f"❌ Ошибка: {e}")
 
     @bot.message_handler(commands=["logs"])
     def cmd_logs(m):
