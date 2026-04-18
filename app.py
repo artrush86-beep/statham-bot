@@ -49,9 +49,6 @@ Statham Trading Bot — RENDER (Unified v2.0)
   DATA_DIR            — директория для JSON-файлов (/tmp или /data)
 
   # ── Новые фильтры (v2.1) ────────────────────────────────────────────
-  ALLOWED_TIMEFRAMES  — "120,240" → только 2ч/4ч авто-исполнение (пусто = все)
-  STRONG_ONLY         — "true" → только STRONG сигналы на биржу
-  MIN_SCORE_EXECUTE   — минимальный Score (0 = отключено, рек. 70)
   ADAPTIVE_RISK       — "true" → адаптивный размер по ATR%
   ATR_HIGH_VOL        — ATR% выше → размер × 0.5 (дефолт 3.0)
   ATR_LOW_VOL         — ATR% ниже → размер × 2.0 (дефолт 1.0)
@@ -129,16 +126,6 @@ DEFAULT_LEVERAGE  = int(os.environ.get("DEFAULT_LEVERAGE",  "10"))
 DEFAULT_SIZE_USDT = float(os.environ.get("DEFAULT_SIZE_USDT", "1"))
 TRAIL_PCT         = float(os.environ.get("TRAIL_PCT", "0.5")) / 100.0
 
-# ✅ IMPROVEMENT #4: Фильтр таймфреймов — только 2ч/4ч для автоисполнения
-# Значение: "120,240" → только 2ч и 4ч. "" → все ТФ
-_ALLOWED_TF_RAW = os.environ.get("ALLOWED_TIMEFRAMES", "120,240").strip()
-ALLOWED_TIMEFRAMES: set[str] = {
-    t.strip() for t in _ALLOWED_TF_RAW.split(",") if t.strip()
-} if _ALLOWED_TF_RAW else set()
-
-# ✅ IMPROVEMENT #5: Только STRONG сигналы для автоисполнения
-STRONG_ONLY_MODE = os.environ.get("STRONG_ONLY", "false").lower() == "true"
-
 # ✅ IMPROVEMENT #8: Адаптивный размер позиции по ATR%
 # ATR% > HIGH_VOLATILITY → уменьшаем риск; ATR% < LOW_VOLATILITY → увеличиваем
 ADAPTIVE_RISK = os.environ.get("ADAPTIVE_RISK", "true").lower() == "true"
@@ -148,8 +135,7 @@ ATR_LOW_VOL    = float(os.environ.get("ATR_LOW_VOL",   "1.0"))  # ATR% ниже 
 # ✅ IMPROVEMENT #9: Cooldown после SL hit (в секундах = bars × tf_minutes × 60)
 SL_COOLDOWN_BARS = int(os.environ.get("SL_COOLDOWN_BARS", "3"))
 
-# ✅ Минимальный Score для автоисполнения (0 = отключено)
-MIN_SCORE_EXECUTE = float(os.environ.get("MIN_SCORE_EXECUTE", "0"))
+
 
 try:
     PAIR_SETTINGS: dict = json.loads(os.environ.get("PAIR_SETTINGS_JSON", "{}"))
@@ -1551,26 +1537,6 @@ def handle_entry(payload: dict):
     trade_id_str  = str(payload.get("trade_id") or "")
     if _alert_dedup_check(trade_id_str, "entry", ticker, timeframe_str):
         write_log(f"ENTRY_DEDUP | {ticker} {direction} {timeframe_str} — skipped duplicate")
-        return
-
-    # ✅ IMPROVEMENT #4: Фильтр таймфреймов
-    if ALLOWED_TIMEFRAMES and timeframe_str and timeframe_str not in ALLOWED_TIMEFRAMES:
-        write_log(f"TF_FILTER | {ticker} tf={timeframe_str} not in {ALLOWED_TIMEFRAMES} → TG-only")
-        send_signals(text or f"📋 Сигнал {ticker} {direction} [{timeframe_str}] — мониторинг")
-        return
-
-    # ✅ IMPROVEMENT #5: STRONG-only режим
-    is_strong = bool(payload.get("is_strong", False))
-    if STRONG_ONLY_MODE and not is_strong and exchange != "none":
-        write_log(f"STRONG_ONLY | {ticker} is_strong=False → TG-only (exchange skipped)")
-        send_signals(text or f"📋 Сигнал {ticker} {direction} — не STRONG, исполнение пропущено")
-        return
-
-    # ✅ IMPROVEMENT #6: Фильтр по Score
-    signal_score = float(payload.get("score", 0) or 0)
-    if MIN_SCORE_EXECUTE > 0 and signal_score < MIN_SCORE_EXECUTE and exchange != "none":
-        write_log(f"SCORE_FILTER | {ticker} score={signal_score} < {MIN_SCORE_EXECUTE} → TG-only")
-        send_signals(text or f"📋 Сигнал {ticker} {direction} score={signal_score:.0f} — ниже порога")
         return
 
     # ✅ IMPROVEMENT #9: Cooldown после SL
