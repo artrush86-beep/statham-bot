@@ -47,7 +47,18 @@ Statham Trading Bot — RENDER (Unified v2.0)
   TRAIL_PCT           — трейлинг % (0.5)
   PAIR_SETTINGS_JSON  — '{"BTCUSDT":{"leverage":10,"size_usdt":100}}'
   DATA_DIR            — директория для JSON-файлов (/tmp или /data)
+
+  # ── Новые фильтры (v2.1) ────────────────────────────────────────────
+  ALLOWED_TIMEFRAMES  — "120,240" → только 2ч/4ч авто-исполнение (пусто = все)
+  STRONG_ONLY         — "true" → только STRONG сигналы на биржу
+  MIN_SCORE_EXECUTE   — минимальный Score (0 = отключено, рек. 70)
+  ADAPTIVE_RISK       — "true" → адаптивный размер по ATR%
+  ATR_HIGH_VOL        — ATR% выше → размер × 0.5 (дефолт 3.0)
+  ATR_LOW_VOL         — ATR% ниже → размер × 2.0 (дефолт 1.0)
+  SL_COOLDOWN_BARS    — баров cooldown после SL (дефолт 3)
+  RENDER_SECRET       — секрет для /debug /trades /stats эндпоинтов
 """
+
 from __future__ import annotations
 import calendar, hashlib, hmac as _hmac, json, math, os, re, time
 import threading, datetime, logging
@@ -118,12 +129,36 @@ DEFAULT_LEVERAGE  = int(os.environ.get("DEFAULT_LEVERAGE",  "10"))
 DEFAULT_SIZE_USDT = float(os.environ.get("DEFAULT_SIZE_USDT", "1"))
 TRAIL_PCT         = float(os.environ.get("TRAIL_PCT", "0.5")) / 100.0
 
+# ✅ IMPROVEMENT #4: Фильтр таймфреймов — только 2ч/4ч для автоисполнения
+# Значение: "120,240" → только 2ч и 4ч. "" → все ТФ
+_ALLOWED_TF_RAW = os.environ.get("ALLOWED_TIMEFRAMES", "120,240").strip()
+ALLOWED_TIMEFRAMES: set[str] = {
+    t.strip() for t in _ALLOWED_TF_RAW.split(",") if t.strip()
+} if _ALLOWED_TF_RAW else set()
+
+# ✅ IMPROVEMENT #5: Только STRONG сигналы для автоисполнения
+STRONG_ONLY_MODE = os.environ.get("STRONG_ONLY", "false").lower() == "true"
+
+# ✅ IMPROVEMENT #8: Адаптивный размер позиции по ATR%
+# ATR% > HIGH_VOLATILITY → уменьшаем риск; ATR% < LOW_VOLATILITY → увеличиваем
+ADAPTIVE_RISK = os.environ.get("ADAPTIVE_RISK", "true").lower() == "true"
+ATR_HIGH_VOL   = float(os.environ.get("ATR_HIGH_VOL",  "3.0"))  # ATR% выше → RISK × 0.5
+ATR_LOW_VOL    = float(os.environ.get("ATR_LOW_VOL",   "1.0"))  # ATR% ниже → RISK × 2.0
+
+# ✅ IMPROVEMENT #9: Cooldown после SL hit (в секундах = bars × tf_minutes × 60)
+SL_COOLDOWN_BARS = int(os.environ.get("SL_COOLDOWN_BARS", "3"))
+
+# ✅ Минимальный Score для автоисполнения (0 = отключено)
+MIN_SCORE_EXECUTE = float(os.environ.get("MIN_SCORE_EXECUTE", "0"))
+
 try:
     PAIR_SETTINGS: dict = json.loads(os.environ.get("PAIR_SETTINGS_JSON", "{}"))
 except Exception:
     PAIR_SETTINGS = {}
 
-TP_CLOSE_PCT = {1: 0.25, 2: 0.20, 3: 0.25, 4: 0.15, 5: 0.10, 6: 0.05}
+# ✅ IMPROVEMENT #3: Оптимизировано по бэктесту — TP6 редко достигается (18%)
+# Фокус на TP1-3: 90% объёма закрывается там, runner на TP4-5
+TP_CLOSE_PCT = {1: 0.40, 2: 0.30, 3: 0.20, 4: 0.07, 5: 0.03, 6: 0.00}
 
 
 def calc_trade_pnl(pos: dict, sl_exit_price: float | None = None) -> dict:
@@ -1355,6 +1390,26 @@ def remove_trade(key: str):
             save_trades(t)
 
 
+# ✅ IMPROVEMENT #2: Redis dedup — 60-сек TTL на входящий алерт
+def _alert_dedup_check(trade_id: str, event: str, ticker: str, timeframe: str) -> bool:
+    """Возвращает True если алерт — дубль (нужно игнорировать).
+    Ключ: alert:dedup:{ticker}:{timeframe}:{event} с TTL 60 сек."""
+    r = _get_redis()
+    if not r:
+        return False  # без Redis дедупликация недоступна
+    # Для entry — более строгий ключ (включаем trade_id если есть)
+    tid_part = trade_id[:16] if trade_id and trade_id not in ("", "null") else "notid"
+    key = f"alert:dedup:{ticker}:{timeframe}:{event}:{tid_part}"
+    try:
+        result = r.set(key, "1", nx=True, ex=60)
+        if result is None:
+            write_log(f"DEDUP_BLOCK | {key} — duplicate alert within 60s, ignoring")
+            return True   # уже было — блокируем
+        return False      # первый раз — пропускаем
+    except Exception as e:
+        write_log(f"DEDUP_ERR | {e}")
+        return False
+
 def dedup_entry(ticker: str, direction: str, current_key: str = ""):
     """Удаляет старые записи о сделке по тому же тикеру/направлению.
     Защита: не трогает текущую сделку (current_key) и записи новее 60 сек."""
@@ -1409,6 +1464,46 @@ def cleanup_old_trades() -> int:
         return len(removed)
 
 
+# ✅ IMPROVEMENT #9: Cooldown по символу после SL
+def _sl_cooldown_set(ticker: str, timeframe: str):
+    """Ставит Redis-блокировку на символ после SL hit."""
+    r = _get_redis()
+    if not r or SL_COOLDOWN_BARS <= 0:
+        return
+    try:
+        tf_mins = int(timeframe) if timeframe.isdigit() else 60
+        ttl_sec = SL_COOLDOWN_BARS * tf_mins * 60
+        key = f"cooldown:sl:{ticker}"
+        r.set(key, timeframe, ex=ttl_sec)
+        write_log(f"COOLDOWN | {ticker} blocked for {ttl_sec}s ({SL_COOLDOWN_BARS} bars × {tf_mins}m)")
+    except Exception as e:
+        write_log(f"COOLDOWN_ERR | {e}")
+
+def _sl_cooldown_active(ticker: str) -> bool:
+    """Возвращает True если символ в cooldown после SL."""
+    r = _get_redis()
+    if not r:
+        return False
+    try:
+        return bool(r.exists(f"cooldown:sl:{ticker}"))
+    except Exception:
+        return False
+
+# ✅ IMPROVEMENT #8: Адаптивный размер позиции по ATR%
+def _adaptive_size(size_usdt: float, atr_pct: float) -> float:
+    """Корректирует размер позиции в зависимости от волатильности."""
+    if not ADAPTIVE_RISK or atr_pct <= 0:
+        return size_usdt
+    if atr_pct > ATR_HIGH_VOL:
+        adj = size_usdt * 0.5
+        write_log(f"ADAPTIVE_RISK | ATR={atr_pct:.2f}% > {ATR_HIGH_VOL}% → size {size_usdt}→{adj:.2f} (-50%)")
+        return adj
+    if atr_pct < ATR_LOW_VOL:
+        adj = min(size_usdt * 2.0, size_usdt * 3.0)
+        write_log(f"ADAPTIVE_RISK | ATR={atr_pct:.2f}% < {ATR_LOW_VOL}% → size {size_usdt}→{adj:.2f} (+100%)")
+        return adj
+    return size_usdt
+
 def finalize_trade(payload: dict, trade_key: str | None, trade_data: dict | None,
                    pos: dict | None, result: str, tp_num: int,
                    close_reason: str) -> bool:
@@ -1449,6 +1544,39 @@ def handle_entry(payload: dict):
         # (trader needs to see every signal; exchange execution is skipped)
         _dup_text = text or f"⚠️ Дубль сигнала #{ticker} {direction} — позиция уже открыта"
         send_signals(_dup_text)
+        return
+
+    # ✅ IMPROVEMENT #2: Dedup — блокируем одинаковые алерты за 60 сек
+    timeframe_str = str(payload.get("timeframe", "")).strip()
+    trade_id_str  = str(payload.get("trade_id") or "")
+    if _alert_dedup_check(trade_id_str, "entry", ticker, timeframe_str):
+        write_log(f"ENTRY_DEDUP | {ticker} {direction} {timeframe_str} — skipped duplicate")
+        return
+
+    # ✅ IMPROVEMENT #4: Фильтр таймфреймов
+    if ALLOWED_TIMEFRAMES and timeframe_str and timeframe_str not in ALLOWED_TIMEFRAMES:
+        write_log(f"TF_FILTER | {ticker} tf={timeframe_str} not in {ALLOWED_TIMEFRAMES} → TG-only")
+        send_signals(text or f"📋 Сигнал {ticker} {direction} [{timeframe_str}] — мониторинг")
+        return
+
+    # ✅ IMPROVEMENT #5: STRONG-only режим
+    is_strong = bool(payload.get("is_strong", False))
+    if STRONG_ONLY_MODE and not is_strong and exchange != "none":
+        write_log(f"STRONG_ONLY | {ticker} is_strong=False → TG-only (exchange skipped)")
+        send_signals(text or f"📋 Сигнал {ticker} {direction} — не STRONG, исполнение пропущено")
+        return
+
+    # ✅ IMPROVEMENT #6: Фильтр по Score
+    signal_score = float(payload.get("score", 0) or 0)
+    if MIN_SCORE_EXECUTE > 0 and signal_score < MIN_SCORE_EXECUTE and exchange != "none":
+        write_log(f"SCORE_FILTER | {ticker} score={signal_score} < {MIN_SCORE_EXECUTE} → TG-only")
+        send_signals(text or f"📋 Сигнал {ticker} {direction} score={signal_score:.0f} — ниже порога")
+        return
+
+    # ✅ IMPROVEMENT #9: Cooldown после SL
+    if _sl_cooldown_active(ticker):
+        write_log(f"COOLDOWN_SKIP | {ticker} {direction} — в cooldown после SL")
+        send_signals(f"⏳ <b>{ticker}</b> в cooldown после SL — сигнал пропущен")
         return
 
     source_msg = send_signals(text or f"📥 Вход {ticker} {direction}")
@@ -1514,9 +1642,25 @@ def handle_entry(payload: dict):
         tp6_price = parse_price(text, "TP6:", "TP 6:", "✅ TP6:")
 
     # ── Диагностика — видно что распарсилось ──────────────────────────
-    write_log(f"PARSED | {ticker} entry={price} sl={sl_price} "
+    # ✅ IMPROVEMENT #1: SL fallback when Pine Script sends null
+    atr_pct_val = float(payload.get("atr_pct", 0) or 0)
+    if sl_price is None and price and price > 0:
+        atr_fallback_pct = atr_pct_val if atr_pct_val > 0 else 2.0
+        atr_abs = price * atr_fallback_pct / 100.0
+        sl_mult = 2.0  # 2 × ATR как минимальный SL
+        if direction == "BUY":
+            sl_price = round(price - atr_abs * sl_mult, 8)
+        else:
+            sl_price = round(price + atr_abs * sl_mult, 8)
+        write_log(f"SL_FALLBACK | {ticker} sl=null → ATR({atr_fallback_pct:.2f}%)×{sl_mult} = {sl_price}")
+
+    write_log(f"PARSED | {ticker} entry={price} sl={sl_price} atr_pct={atr_pct_val} "
               f"tp1={tp1_price} tp2={tp2_price} tp3={tp3_price} "
               f"tp4={tp4_price} tp5={tp5_price} tp6={tp6_price}")
+
+    # ✅ IMPROVEMENT #8: Адаптивный размер по ATR%
+    size_usdt = _adaptive_size(size_usdt, atr_pct_val)
+
     qty = 1.0
     sl_order_id = ""
     tp_order_ids: dict = {}
@@ -1912,6 +2056,8 @@ def handle_sl_hit(payload: dict):
     # Store pnl in finalize payload
     payload["_bot_pnl"] = pnl
     finalize_trade(payload, trade_key, trade, pos_snapshot, result, highest_tp, close_reason="sl_hit")
+    # ✅ IMPROVEMENT #9: Cooldown после SL hit
+    _sl_cooldown_set(ticker, str(payload.get("timeframe", "60")))
 
 
 def handle_sl_moved(payload: dict):
@@ -2513,11 +2659,71 @@ if bot:
             "👉 /help — список команд"
         ))
 
+    @bot.message_handler(commands=["pnl", "pnls"])
+    def cmd_pnl(m):
+        """✅ IMPROVEMENT #10: Live P&L — текущие позиции с расстоянием до SL/TP."""
+        if not is_admin_user(m.from_user.id):
+            _reply(m, "❌ Только для администраторов."); return
+        positions = load_positions()
+        if not positions:
+            _reply(m, "📭 Нет открытых позиций."); return
+        lines = ["💹 <b>Live P&L — Открытые позиции</b>\n"]
+        now_ts = int(time.time())
+        for pkey, pos in positions.items():
+            ticker    = pos.get("ticker", pkey)
+            direction = pos.get("direction", "?")
+            entry     = float(pos.get("entry_price") or 0)
+            sl        = float(pos.get("sl_price") or 0)
+            tp1       = float(pos.get("tp1_price") or 0)
+            lev       = int(pos.get("leverage") or 1)
+            exchange  = pos.get("exchange", "?")
+            created   = int(pos.get("created_at") or 0)
+            duration_min = (now_ts - created) // 60 if created else 0
+
+            # Текущая цена
+            cur_price = 0.0
+            try:
+                cur_price = ex_get_price(ticker, exchange)
+            except Exception:
+                pass
+
+            arrow = "🟢" if direction == "BUY" else "🔴"
+            side_l = "LONG" if direction == "BUY" else "SHORT"
+
+            # PnL %
+            pnl_pct = 0.0
+            if entry > 0 and cur_price > 0:
+                if direction == "BUY":
+                    pnl_pct = (cur_price - entry) / entry * 100 * lev
+                else:
+                    pnl_pct = (entry - cur_price) / entry * 100 * lev
+            pnl_icon = "✅" if pnl_pct > 0 else ("❌" if pnl_pct < 0 else "➖")
+
+            # Расстояние до SL/TP1
+            sl_dist = ""
+            tp_dist = ""
+            if sl > 0 and cur_price > 0:
+                sl_pct = abs(cur_price - sl) / cur_price * 100
+                sl_dist = f"{sl_pct:.2f}%"
+            if tp1 > 0 and cur_price > 0:
+                tp_pct = abs(tp1 - cur_price) / cur_price * 100
+                tp_dist = f"{tp_pct:.2f}%"
+
+            dur_str = f"{duration_min}м" if duration_min < 60 else f"{duration_min//60}ч{duration_min%60}м"
+            lines.append(
+                f"{arrow} <b>#{ticker}</b> {side_l} [{exchange}] {lev}x\n"
+                f"  Вход: {entry:.6g} → Текущая: {cur_price:.6g}\n"
+                f"  {pnl_icon} P&L: <b>{pnl_pct:+.2f}%</b> | Время: {dur_str}\n"
+                f"  ⛔ SL: {sl:.6g} (до SL: {sl_dist}) | ✅ TP1: {tp1:.6g} (до TP1: {tp_dist})\n"
+            )
+        _reply(m, "\n".join(lines))
+
     @bot.message_handler(commands=["help"])
     def cmd_help(m):
         _reply(m, (
             "📋 <b>Команды Statham Bot v2</b>\n\n"
             "<b>📊 Статистика:</b>\n"
+            "/pnl — Live P&L открытых позиций\n"
             "/stats — Win Rate\n"
             "/daily_report — дневной отчёт\n"
             "/weekly_report — недельный отчёт\n"
