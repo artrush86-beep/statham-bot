@@ -49,7 +49,6 @@ Statham Trading Bot — RENDER (Unified v2.0)
   DATA_DIR            — директория для JSON-файлов (/tmp или /data)
 
   # ── Новые фильтры (v2.1) ────────────────────────────────────────────
-  SL_COOLDOWN_BARS    — баров cooldown после SL (дефолт 3)
   RENDER_SECRET       — секрет для /debug /trades /stats эндпоинтов
 """
 
@@ -130,10 +129,9 @@ def _parse_leverage(raw: str, default: int = 10) -> int:
         return default
 DEFAULT_LEVERAGE  = _parse_leverage(os.environ.get("DEFAULT_LEVERAGE", "10"))
 DEFAULT_SIZE_USDT = float(os.environ.get("DEFAULT_SIZE_USDT", "1"))
-TRAIL_PCT         = float(os.environ.get("TRAIL_PCT", "0.5")) / 100.0
+TRAIL_PCT         = 0.0  # Trail управляется индикатором через sl_moved алерты
 
 # ✅ IMPROVEMENT #9: Cooldown после SL hit (в секундах = bars × tf_minutes × 60)
-SL_COOLDOWN_BARS = int(os.environ.get("SL_COOLDOWN_BARS", "3"))
 
 
 
@@ -1450,30 +1448,6 @@ def cleanup_old_trades() -> int:
         return len(removed)
 
 
-# ✅ IMPROVEMENT #9: Cooldown по символу после SL
-def _sl_cooldown_set(ticker: str, timeframe: str):
-    """Ставит Redis-блокировку на символ после SL hit."""
-    r = _get_redis()
-    if not r or SL_COOLDOWN_BARS <= 0:
-        return
-    try:
-        tf_mins = int(timeframe) if timeframe.isdigit() else 60
-        ttl_sec = SL_COOLDOWN_BARS * tf_mins * 60
-        key = f"cooldown:sl:{ticker}"
-        r.set(key, timeframe, ex=ttl_sec)
-        write_log(f"COOLDOWN | {ticker} blocked for {ttl_sec}s ({SL_COOLDOWN_BARS} bars × {tf_mins}m)")
-    except Exception as e:
-        write_log(f"COOLDOWN_ERR | {e}")
-
-def _sl_cooldown_active(ticker: str) -> bool:
-    """Возвращает True если символ в cooldown после SL."""
-    r = _get_redis()
-    if not r:
-        return False
-    try:
-        return bool(r.exists(f"cooldown:sl:{ticker}"))
-    except Exception:
-        return False
 
 
 def finalize_trade(payload: dict, trade_key: str | None, trade_data: dict | None,
@@ -1523,12 +1497,6 @@ def handle_entry(payload: dict):
     trade_id_str  = str(payload.get("trade_id") or "")
     if _alert_dedup_check(trade_id_str, "entry", ticker, timeframe_str):
         write_log(f"ENTRY_DEDUP | {ticker} {direction} {timeframe_str} — skipped duplicate")
-        return
-
-    # ✅ IMPROVEMENT #9: Cooldown после SL
-    if _sl_cooldown_active(ticker):
-        write_log(f"COOLDOWN_SKIP | {ticker} {direction} — в cooldown после SL")
-        send_signals(f"⏳ <b>{ticker}</b> в cooldown после SL — сигнал пропущен")
         return
 
     source_msg = send_signals(text or f"📥 Вход {ticker} {direction}")
@@ -2005,8 +1973,6 @@ def handle_sl_hit(payload: dict):
     # Store pnl in finalize payload
     payload["_bot_pnl"] = pnl
     finalize_trade(payload, trade_key, trade, pos_snapshot, result, highest_tp, close_reason="sl_hit")
-    # ✅ IMPROVEMENT #9: Cooldown после SL hit
-    _sl_cooldown_set(ticker, str(payload.get("timeframe", "60")))
 
 
 def handle_sl_moved(payload: dict):
@@ -2540,7 +2506,8 @@ def _position_manager():
                 if exchange == "none":
                     continue
 
-                if not pos.get("trail_active"):
+                # Trail управляется индикатором через sl_moved. Bot trail отключён.
+                if not pos.get("trail_active") or TRAIL_PCT == 0.0:
                     continue
                 ticker   = pos["symbol"]
                 cur_sl   = pos.get("trail_sl") or pos.get("sl_price") or 0
