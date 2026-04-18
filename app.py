@@ -49,9 +49,6 @@ Statham Trading Bot — RENDER (Unified v2.0)
   DATA_DIR            — директория для JSON-файлов (/tmp или /data)
 
   # ── Новые фильтры (v2.1) ────────────────────────────────────────────
-  ADAPTIVE_RISK       — "true" → адаптивный размер по ATR%
-  ATR_HIGH_VOL        — ATR% выше → размер × 0.5 (дефолт 3.0)
-  ATR_LOW_VOL         — ATR% ниже → размер × 2.0 (дефолт 1.0)
   SL_COOLDOWN_BARS    — баров cooldown после SL (дефолт 3)
   RENDER_SECRET       — секрет для /debug /trades /stats эндпоинтов
 """
@@ -122,15 +119,18 @@ BYBIT_PAIRS   = _parse_pairs("BYBIT_PAIRS")
 BINGX_PAIRS   = _parse_pairs("BINGX_PAIRS")
 ALLOWED_PAIRS = BYBIT_PAIRS | BINGX_PAIRS
 
-DEFAULT_LEVERAGE  = int(os.environ.get("DEFAULT_LEVERAGE",  "10"))
+# DEFAULT_LEVERAGE должен быть одним числом, например "10"
+# Используй PAIR_SETTINGS_JSON для разных плечей на разные пары
+def _parse_leverage(raw: str, default: int = 10) -> int:
+    """Безопасный парсинг плеча. Игнорирует мусор вроде '5-50'."""
+    try:
+        v = int(str(raw).strip().split("-")[0].split()[0])
+        return max(1, min(v, 200))
+    except Exception:
+        return default
+DEFAULT_LEVERAGE  = _parse_leverage(os.environ.get("DEFAULT_LEVERAGE", "10"))
 DEFAULT_SIZE_USDT = float(os.environ.get("DEFAULT_SIZE_USDT", "1"))
 TRAIL_PCT         = float(os.environ.get("TRAIL_PCT", "0.5")) / 100.0
-
-# ✅ IMPROVEMENT #8: Адаптивный размер позиции по ATR%
-# ATR% > HIGH_VOLATILITY → уменьшаем риск; ATR% < LOW_VOLATILITY → увеличиваем
-ADAPTIVE_RISK = os.environ.get("ADAPTIVE_RISK", "true").lower() == "true"
-ATR_HIGH_VOL   = float(os.environ.get("ATR_HIGH_VOL",  "3.0"))  # ATR% выше → RISK × 0.5
-ATR_LOW_VOL    = float(os.environ.get("ATR_LOW_VOL",   "1.0"))  # ATR% ниже → RISK × 2.0
 
 # ✅ IMPROVEMENT #9: Cooldown после SL hit (в секундах = bars × tf_minutes × 60)
 SL_COOLDOWN_BARS = int(os.environ.get("SL_COOLDOWN_BARS", "3"))
@@ -1475,20 +1475,6 @@ def _sl_cooldown_active(ticker: str) -> bool:
     except Exception:
         return False
 
-# ✅ IMPROVEMENT #8: Адаптивный размер позиции по ATR%
-def _adaptive_size(size_usdt: float, atr_pct: float) -> float:
-    """Корректирует размер позиции в зависимости от волатильности."""
-    if not ADAPTIVE_RISK or atr_pct <= 0:
-        return size_usdt
-    if atr_pct > ATR_HIGH_VOL:
-        adj = size_usdt * 0.5
-        write_log(f"ADAPTIVE_RISK | ATR={atr_pct:.2f}% > {ATR_HIGH_VOL}% → size {size_usdt}→{adj:.2f} (-50%)")
-        return adj
-    if atr_pct < ATR_LOW_VOL:
-        adj = min(size_usdt * 2.0, size_usdt * 3.0)
-        write_log(f"ADAPTIVE_RISK | ATR={atr_pct:.2f}% < {ATR_LOW_VOL}% → size {size_usdt}→{adj:.2f} (+100%)")
-        return adj
-    return size_usdt
 
 def finalize_trade(payload: dict, trade_key: str | None, trade_data: dict | None,
                    pos: dict | None, result: str, tp_num: int,
@@ -1623,9 +1609,6 @@ def handle_entry(payload: dict):
     write_log(f"PARSED | {ticker} entry={price} sl={sl_price} atr_pct={atr_pct_val} "
               f"tp1={tp1_price} tp2={tp2_price} tp3={tp3_price} "
               f"tp4={tp4_price} tp5={tp5_price} tp6={tp6_price}")
-
-    # ✅ IMPROVEMENT #8: Адаптивный размер по ATR%
-    size_usdt = _adaptive_size(size_usdt, atr_pct_val)
 
     qty = 1.0
     sl_order_id = ""
