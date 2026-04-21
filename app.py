@@ -1257,7 +1257,7 @@ def _build_report(trades: list, title: str, show_last: int = 5,
                 _s = "+" if avg_tp_pnl >= 0 else ""
                 pnl_str = f"  <i>avg {_s}{avg_tp_pnl}%</i>"
             else:
-                pnl_str = ""
+                pnl_str = "  <i>avg n/a</i>"
             text += f"  TP{n}: {cnt}x  <code>{bar}</code>{pnl_str}\n"
     # ── Чистые SL (без TP) ───────────────────────────────────────────
     if sl_only:
@@ -2678,12 +2678,16 @@ if bot:
         wins   = s.get("wins", 0)
         losses = s.get("losses", 0)
         total  = s.get("total", 0)
-        wr     = calc_winrate(wins, wins + losses)
+        # FIX: WR = (wins + partials) / (wins + partials + losses)
+        history    = load_history()
+        _partials_cnt = sum(1 for r in history if r.get("result") == "partial")
+        wr         = calc_winrate(wins + _partials_cnt, wins + _partials_cnt + losses)
         # TP ≥ 3 из истории
-        history = load_history()
-        tp3plus = sum(1 for r in history if r.get("result") == "win"
-                      and int(r.get("tp_num") or 0) >= 3)
-        pnl_vals = [r["pnl"].get("pnl_pct", 0) for r in history if r.get("pnl")]
+        tp3plus = sum(1 for r in history if r.get("result") in ("win","partial")
+                      and int(r.get("highest_tp_hit") or r.get("tp_num") or 0) >= 3)
+        # P&L среднее — пропускаем нули (entry_price был null)
+        pnl_vals = [r["pnl"]["pnl_pct"] for r in history
+                    if r.get("pnl") and r["pnl"].get("pnl_pct") != 0.0]
         avg_pnl_all = round(sum(pnl_vals) / len(pnl_vals), 2) if pnl_vals else None
         pnl_line = ""
         if avg_pnl_all is not None:
@@ -2704,9 +2708,11 @@ if bot:
                 tp_breakdown += f"  TP{n}: {_tp_all[n]}x\n"
         _reply(m, (
             f"📊 <b>Статистика Statham Strategy</b>\n\n"
-            f"{_wr_icon(wr)} Win Rate: <b>{wr}%</b>\n"
-            f"✅ TP (≥TP3): {tp3plus}   ✅ TP всего: {wins}\n"
+            f"{_wr_icon(wr)} Win Rate: <b>{wr}%</b>"
+            f"  <i>({wins + _partials_cnt}/{wins + _partials_cnt + losses})</i>\n"
+            f"✅ TP закрыты полностью: {wins}\n"
             f"🔶 Partial (TP+SL): {len(_partials_all)}\n"
+            f"✅ TP (≥TP3 хит): {tp3plus}\n"
             f"❌ SL чистый: {losses}\n"
             f"📈 Всего закрыто: <b>{total}</b>"
             f"{pnl_line}"
