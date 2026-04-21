@@ -1149,6 +1149,9 @@ def save_trade_to_history(payload: dict, trade_data: dict | None, result: str, t
         "date_msk": _msk().strftime("%Y-%m-%d"),
         "week_msk": f"{_msk().year}-W{_msk().isocalendar()[1]:02d}",
         "pnl": payload.get("_bot_pnl", {}),
+        # SL type detection: trail_active = trailing stop was on; tp1_hit = BE active
+        "trail_active": bool(pos.get("trail_active", False)),
+        "be_active":    bool(pos.get("tp1_hit", False)),  # TP1 hit → SL moved to BE
     }
     with _state_lock:
         history = load_history()
@@ -1259,17 +1262,42 @@ def _build_report(trades: list, title: str, show_last: int = 5,
             else:
                 pnl_str = "  <i>avg n/a</i>"
             text += f"  TP{n}: {cnt}x  <code>{bar}</code>{pnl_str}\n"
-    # ── Чистые SL (без TP) ───────────────────────────────────────────
-    if sl_only:
-        # Skip zero P&L (entry_price was None → stored 0.0, meaningless)
-        sl_pnl_list = [r["pnl"]["pnl_pct"] for r in sl_only
-                       if r.get("pnl") and r["pnl"].get("pnl_pct") != 0.0]
-        if sl_pnl_list:
-            avg_sl_pnl = round(sum(sl_pnl_list) / len(sl_pnl_list), 1)
-            _sl_sign = "+" if avg_sl_pnl > 0 else ""
-            text += f"  SL (чистый): {len(sl_only)}x  <i>avg {_sl_sign}{avg_sl_pnl}%</i>\n"
-        else:
-            text += f"  SL (чистый): {len(sl_only)}x  <i>n/a (нет данных о цене входа)</i>\n"
+    # ── SL разбивка по типам ─────────────────────────────────────────
+    def _avg_pnl_sl(recs):
+        vals = [r["pnl"]["pnl_pct"] for r in recs
+                if r.get("pnl") and r["pnl"].get("pnl_pct") != 0.0]
+        if not vals: return ""
+        avg = round(sum(vals)/len(vals), 1)
+        return f"  <i>avg {'+'if avg>=0 else ''}{avg}%</i>"
+
+    all_sl_recs = [r for r in trades if r.get("close_reason") == "sl_hit"
+                   or r.get("result") in ("loss","partial")]
+    _sl_pure  = [r for r in all_sl_recs
+                 if not r.get("trail_active") and not r.get("be_active")
+                 and r.get("result") == "loss"]
+    _sl_be    = [r for r in all_sl_recs
+                 if r.get("be_active") and not r.get("trail_active")]
+    _sl_trail = [r for r in all_sl_recs if r.get("trail_active")]
+    _sl_old   = [r for r in sl_only
+                 if "trail_active" not in r and "be_active" not in r]
+
+    if _sl_pure or _sl_be or _sl_trail or _sl_old:
+        text += "\n<b>Разбивка по SL:</b>\n"
+        if _sl_pure:
+            text += f"  ❌ Чистый SL: {len(_sl_pure)}x{_avg_pnl_sl(_sl_pure)}\n"
+        if _sl_be:
+            text += f"  🔒 BE-стоп: {len(_sl_be)}x{_avg_pnl_sl(_sl_be)}\n"
+        if _sl_trail:
+            text += f"  📈 Trail-стоп: {len(_sl_trail)}x{_avg_pnl_sl(_sl_trail)}\n"
+        if _sl_old:
+            sl_pnl_list = [r["pnl"]["pnl_pct"] for r in _sl_old
+                           if r.get("pnl") and r["pnl"].get("pnl_pct") != 0.0]
+            if sl_pnl_list:
+                avg_sl_pnl = round(sum(sl_pnl_list)/len(sl_pnl_list), 1)
+                _sl_sign = "+" if avg_sl_pnl > 0 else ""
+                text += f"  ❌ SL: {len(_sl_old)}x  <i>avg {_sl_sign}{avg_sl_pnl}%</i>\n"
+            else:
+                text += f"  ❌ SL: {len(_sl_old)}x  <i>avg n/a</i>\n"
 
     # ── Топ тикеры (для недельного/месячного) ────────────────────────
     if show_top_tickers and total > 0:
@@ -2701,11 +2729,39 @@ if bot:
             n = int(r.get("highest_tp_hit") or r.get("tp_num") or 0)
             if n:
                 _tp_all[n] = _tp_all.get(n, 0) + 1
+        # ── TP разбивка ──────────────────────────────────────────────────────
         tp_breakdown = ""
         if _tp_all:
-            tp_breakdown = "\n\n<b>Разбивка по TP:</b>\n"
+            tp_breakdown = "\n<b>Разбивка по TP:</b>\n"
             for n in sorted(_tp_all.keys()):
                 tp_breakdown += f"  TP{n}: {_tp_all[n]}x\n"
+
+        # ── SL разбивка по типу ───────────────────────────────────────────────
+        _all_sl = [r for r in history if r.get("close_reason") == "sl_hit"
+                   or r.get("result") in ("loss", "partial")]
+        sl_pure   = [r for r in _all_sl if not r.get("trail_active") and not r.get("be_active")
+                     and r.get("result") == "loss"]
+        sl_be     = [r for r in _all_sl if r.get("be_active") and not r.get("trail_active")]
+        sl_trail  = [r for r in _all_sl if r.get("trail_active")]
+        # Fallback: old records without trail/be fields — classify by highest_tp
+        sl_partial = [r for r in _all_sl if r.get("result") == "partial"
+                      and not r.get("trail_active") and not r.get("be_active")]
+
+        def _sl_avg(recs):
+            vals = [r["pnl"]["pnl_pct"] for r in recs
+                    if r.get("pnl") and r["pnl"].get("pnl_pct") != 0.0]
+            if not vals: return ""
+            avg = round(sum(vals)/len(vals), 1)
+            s = "+" if avg >= 0 else ""
+            return f"  <i>avg {s}{avg}%</i>"
+
+        sl_breakdown = "\n<b>Разбивка по SL:</b>\n"
+        sl_breakdown += f"  ❌ Чистый SL: {len(sl_pure)}x{_sl_avg(sl_pure)}\n"
+        sl_breakdown += f"  🔒 BE-стоп (после TP1): {len(sl_be)}x{_sl_avg(sl_be)}\n"
+        sl_breakdown += f"  📈 Trail-стоп: {len(sl_trail)}x{_sl_avg(sl_trail)}\n"
+        if sl_partial:
+            sl_breakdown += f"  🔶 Partial (TP+SL): {len(sl_partial)}x{_sl_avg(sl_partial)}\n"
+
         _reply(m, (
             f"📊 <b>Статистика Statham Strategy</b>\n\n"
             f"{_wr_icon(wr)} Win Rate: <b>{wr}%</b>"
@@ -2713,10 +2769,11 @@ if bot:
             f"✅ TP закрыты полностью: {wins}\n"
             f"🔶 Partial (TP+SL): {len(_partials_all)}\n"
             f"✅ TP (≥TP3 хит): {tp3plus}\n"
-            f"❌ SL чистый: {losses}\n"
+            f"❌ SL всего: {losses}\n"
             f"📈 Всего закрыто: <b>{total}</b>"
             f"{pnl_line}"
             f"{tp_breakdown}"
+            f"{sl_breakdown}"
         ))
 
     @bot.message_handler(commands=["daily_report"])
