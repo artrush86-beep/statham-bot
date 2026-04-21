@@ -1196,14 +1196,17 @@ def _build_report(trades: list, title: str, show_last: int = 5,
     partials = [r for r in trades if r["result"] == "partial"]
     manuals  = [r for r in trades if r["result"] == "manual"]
     scored   = len(wins) + len(losses) + len(partials)
-    total   = len(trades)
-    wr      = calc_winrate(len(wins), scored)
+    total    = len(trades)
+    # Partial = SL after TP1+ = profitable trade → count as win in WR
+    wr       = calc_winrate(len(wins) + len(partials), scored)
     if not trades:
         return f"{title}\n\n<i>Нет данных за период.</i>"
     avg_dur = int(sum(r.get("duration_sec", 0) for r in trades) / total) if total else 0
 
     # Средний P&L из сохранённых расчётов бота
-    pnl_values = [r["pnl"].get("pnl_pct", 0) for r in trades if r.get("pnl")]
+    # Skip zero P&L records (entry_price was None → stored 0.0)
+    pnl_values = [r["pnl"]["pnl_pct"] for r in trades
+                  if r.get("pnl") and r["pnl"].get("pnl_pct") != 0.0]
     avg_pnl = round(sum(pnl_values) / len(pnl_values), 2) if pnl_values else None
 
     # ── Разбивка по TP: считаем highest_tp_hit для всех закрытых сделок ─
@@ -1217,7 +1220,8 @@ def _build_report(trades: list, title: str, show_last: int = 5,
             tp_counts[n] = tp_counts.get(n, 0) + 1
         # Collect P&L by highest TP
         pnl_data = r.get("pnl", {})
-        if pnl_data and n:
+        # Skip zero P&L (entry_price was None → meaningless average)
+        if pnl_data and n and pnl_data.get("pnl_pct", 0) != 0.0:
             if n not in tp_pnl_sums:
                 tp_pnl_sums[n] = []
             tp_pnl_sums[n].append(pnl_data.get("pnl_pct", 0))
@@ -1257,10 +1261,15 @@ def _build_report(trades: list, title: str, show_last: int = 5,
             text += f"  TP{n}: {cnt}x  <code>{bar}</code>{pnl_str}\n"
     # ── Чистые SL (без TP) ───────────────────────────────────────────
     if sl_only:
-        sl_pnl_list = [r.get("pnl", {}).get("pnl_pct", 0) for r in sl_only if r.get("pnl")]
+        # Skip zero P&L (entry_price was None → stored 0.0, meaningless)
+        sl_pnl_list = [r["pnl"]["pnl_pct"] for r in sl_only
+                       if r.get("pnl") and r["pnl"].get("pnl_pct") != 0.0]
         if sl_pnl_list:
             avg_sl_pnl = round(sum(sl_pnl_list) / len(sl_pnl_list), 1)
-            text += f"  SL (чистый): {len(sl_only)}x  <i>avg {avg_sl_pnl}%</i>\n"
+            _sl_sign = "+" if avg_sl_pnl > 0 else ""
+            text += f"  SL (чистый): {len(sl_only)}x  <i>avg {_sl_sign}{avg_sl_pnl}%</i>\n"
+        else:
+            text += f"  SL (чистый): {len(sl_only)}x  <i>n/a (нет данных о цене входа)</i>\n"
 
     # ── Топ тикеры (для недельного/месячного) ────────────────────────
     if show_top_tickers and total > 0:
@@ -2660,7 +2669,7 @@ if bot:
             "/reset_stats — сбросить статистику\n"
             "/cleanup — удалить зависшие сделки\n"
             "/clean — очистить trades+positions\n"
-            "/logs — последние строки лога\n/diagnostics — проверка всех API\n/redis_fix — переподключить Redis\n/redis_info — статус Redis + ключи\n/redis_clear_history — очистить историю\n/redis_clear_all — очистить всё Redis\n/sync — сверить позиции с биржами"
+            "/logs — последние строки лога\n/diagnostics — проверка всех API\n/redis_fix — переподключить Redis\n/redis_info — статус Redis + ключи\n/redis_clear_history — очистить историю\n/redis_clear_all — очистить всё Redis\n/sync — сверить позиции с биржами\n/pnl — Live P&L открытых позиций"
         ))
 
     @bot.message_handler(commands=["stats"])
@@ -2846,16 +2855,109 @@ if bot:
     @bot.message_handler(commands=["active"])
     def cmd_active(m):
         positions = load_positions()
-        if not positions: _reply(m, "🔵 Нет открытых позиций."); return
-        lines = [f"📌 <b>Открытых позиций: {len(positions)}</b>\n"]
-        for pkey, pos in positions.items():
-            exch = pos.get("exchange","?")
-            lines.append(
-                f"• {pos['symbol']} {pos['direction']} [{exch}]\n"
-                f"  Вход: {pos.get('entry_price','?')}  |  Осталось: {pos.get('remaining_qty','?')}\n"
-                f"  SL: {pos.get('sl_price','—')}  |  Trail: {'✅' if pos.get('trail_active') else '—'}"
+        if not positions:
+            _reply(m, "🔵 Нет открытых позиций."); return
+
+        longs  = {k:v for k,v in positions.items() if v.get("direction","").upper()=="BUY"}
+        shorts = {k:v for k,v in positions.items() if v.get("direction","").upper()=="SELL"}
+
+        def _get_live_price(sym, exch):
+            try:
+                if exch == "bybit" and BYBIT_AVAILABLE: return bybit_get_price(sym)
+                if exch == "bingx" and BINGX_AVAILABLE: return bingx_get_price(sym)
+                # telegram-only: try market data without auth
+                try: return bybit_get_price(sym)
+                except Exception: pass
+                try: return bingx_get_price(sym)
+                except Exception: pass
+            except Exception: pass
+            return 0.0
+
+        def _fmt_pos(pkey, pos):
+            sym      = pos.get("symbol", pkey.split("_")[0])
+            dirn     = pos.get("direction","?").upper()
+            exch     = pos.get("exchange","?")
+            lev      = int(pos.get("leverage", 10))
+            entry    = float(pos.get("entry_price") or 0)
+            sl       = float(pos.get("sl_price") or pos.get("trail_sl") or 0)
+            tp1      = float(pos.get("tp1_price") or 0)
+            remaining= float(pos.get("remaining_qty") or 0)
+            created  = int(pos.get("created_at") or 0)
+            trail    = pos.get("trail_active", False)
+
+            cur = _get_live_price(sym, exch)
+
+            pnl_pct = 0.0; pnl_usd = 0.0
+            if entry > 0 and cur > 0:
+                pnl_pct = ((cur-entry)/entry if dirn=="BUY" else (entry-cur)/entry)*lev*100
+                # notional = entry * qty, uPNL ≈ notional * move_pct
+                notional = entry * remaining
+                pnl_usd  = notional * ((cur-entry)/entry if dirn=="BUY" else (entry-cur)/entry)
+
+            dur_str  = fmt_duration(int(time.time())-created) if created else "?"
+            pnl_icon = "✅" if pnl_pct>0.5 else ("❌" if pnl_pct<-1 else "➖")
+            dir_icon = "🟢" if dirn=="BUY" else "🔴"
+            dir_lbl  = "LONG" if dirn=="BUY" else "SHORT"
+            exch_tag = f"[{exch.upper()}]" if exch!="none" else "[TG]"
+            pnl_sign = "+" if pnl_pct>=0 else ""
+            usd_sign = "+" if pnl_usd>=0 else ""
+
+            flags = []
+            if pos.get("tp1_hit"): flags.append("🔒BE")
+            if trail:              flags.append("📈Trail")
+            highest = max([n for n in range(1,7) if pos.get(f"tp{n}_hit")], default=0)
+            if highest > 0:        flags.append(f"TP{highest}✓")
+            flag_str = "  " + " ".join(flags) if flags else ""
+
+            sl_dist = ""
+            if sl>0 and cur>0:
+                pct = abs(cur-sl)/cur*100
+                sl_dist = f" | до SL: {pct:.1f}%"
+
+            size_str = f"{remaining:.4g}" if remaining>0 else "—"
+            entry_str = f"{entry:.6g}" if entry>0 else "—"
+            cur_str   = f"{cur:.6g}"   if cur>0   else "—"
+            sl_str    = f"{sl:.6g}"    if sl>0    else "—"
+            tp1_str   = f"{tp1:.6g}"   if tp1>0   else "—"
+            pnl_usd_s = f"  uPNL: <b>{usd_sign}{pnl_usd:.2f}$</b>" if entry>0 and cur>0 else ""
+
+            return (
+                f"{dir_icon} <b>#{sym}</b> {dir_lbl} {exch_tag} {lev}x{flag_str}\n"
+                f"   Вход: <code>{entry_str}</code>  |  Размер: {size_str}  |  Текущая: <code>{cur_str}</code>\n"
+                f"   {pnl_icon} P&L: <b>{pnl_sign}{pnl_pct:.1f}%</b>{pnl_usd_s}  |  Время: {dur_str}\n"
+                f"   ⛔ SL: {sl_str}{sl_dist}  |  ✅ TP1: {tp1_str}"
             )
-        _reply(m, "\n".join(lines))
+
+        lines = [f"📌 <b>Открытых позиций: {len(positions)}</b>\n"]
+        if shorts:
+            lines.append(f"📉 <b>SHORT позиции ({len(shorts)}):</b>")
+            for pk,pos in sorted(shorts.items(), key=lambda x: x[1].get("created_at",0)):
+                lines.append(_fmt_pos(pk, pos))
+        if longs:
+            if shorts: lines.append("")
+            lines.append(f"📈 <b>LONG позиции ({len(longs)}):</b>")
+            for pk,pos in sorted(longs.items(), key=lambda x: x[1].get("created_at",0)):
+                lines.append(_fmt_pos(pk, pos))
+
+        full = "\n".join(lines)
+        if len(full) > 3800:
+            # Split on position boundaries
+            header = lines[0] + "\n"
+            chunks = [header]
+            cur_chunk = ""
+            for l in lines[1:]:
+                if len(cur_chunk)+len(l)+1 > 3600:
+                    chunks[-1] += cur_chunk
+                    chunks.append("")
+                    cur_chunk = l + "\n"
+                else:
+                    cur_chunk += l + "\n"
+            if cur_chunk: chunks[-1] += cur_chunk
+            for ch in chunks:
+                if ch.strip():
+                    send_tg(ch, thread_id=getattr(m,"message_thread_id",None), chat_id=str(m.chat.id))
+        else:
+            _reply(m, full)
 
     @bot.message_handler(commands=["pairs"])
     def cmd_pairs(m):
@@ -3027,6 +3129,77 @@ if bot:
             _reply(m, "✅ Redis переподключён успешно.")
         else:
             _reply(m, "❌ Redis переподключение не удалось — проверь REDIS_URL.")
+
+    @bot.message_handler(commands=["pnl"])
+    def cmd_pnl(m):
+        """Быстрый Live P&L всех открытых позиций."""
+        positions = load_positions()
+        if not positions:
+            _reply(m, "💹 Нет открытых позиций."); return
+
+        lines = ["💹 <b>Live P&L — Открытые позиции</b>\n"]
+        pnl_list = []
+
+        for pkey, pos in positions.items():
+            sym   = pos.get("symbol", "?")
+            dirn  = pos.get("direction","?").upper()
+            exch  = pos.get("exchange","?")
+            lev   = int(pos.get("leverage",10))
+            entry = float(pos.get("entry_price") or 0)
+            sl    = float(pos.get("sl_price") or pos.get("trail_sl") or 0)
+            tp1   = float(pos.get("tp1_price") or 0)
+            remaining = float(pos.get("remaining_qty") or 0)
+            created   = int(pos.get("created_at") or 0)
+
+            cur = 0.0
+            try:
+                if exch=="bybit" and BYBIT_AVAILABLE: cur = bybit_get_price(sym)
+                elif exch=="bingx" and BINGX_AVAILABLE: cur = bingx_get_price(sym)
+                else:
+                    try: cur = bybit_get_price(sym)
+                    except Exception:
+                        try: cur = bingx_get_price(sym)
+                        except Exception: pass
+            except Exception: pass
+
+            pnl_pct = 0.0; pnl_usd = 0.0
+            if entry>0 and cur>0:
+                pnl_pct = ((cur-entry)/entry if dirn=="BUY" else (entry-cur)/entry)*lev*100
+                pnl_usd = entry*remaining*((cur-entry)/entry if dirn=="BUY" else (entry-cur)/entry)
+                pnl_list.append(pnl_pct)
+
+            dir_icon  = "🟢" if dirn=="BUY" else "🔴"
+            pnl_icon  = "✅" if pnl_pct>0.5 else ("❌" if pnl_pct<-1 else "➖")
+            pnl_sign  = "+" if pnl_pct>=0 else ""
+            usd_sign  = "+" if pnl_usd>=0 else ""
+            dur       = fmt_duration(int(time.time())-created) if created else "?"
+            exch_tag  = exch.upper() if exch!="none" else "TG"
+
+            sl_dist = ""
+            if sl>0 and cur>0:
+                sl_dist = f" (до SL: {abs(cur-sl)/cur*100:.1f}%)"
+
+            trail_be = ""
+            highest = max([n for n in range(1,7) if pos.get(f"tp{n}_hit")], default=0)
+            if pos.get("trail_active"): trail_be = " 📈"
+            elif pos.get("tp1_hit"):    trail_be = " 🔒"
+
+            cur_str = f"{cur:.6g}" if cur>0 else "—"
+            usd_str = f" ({usd_sign}{pnl_usd:.2f}$)" if entry>0 and cur>0 else ""
+
+            lines.append(
+                f"{dir_icon} <b>#{sym}</b> {dirn} [{exch_tag}] {lev}x{trail_be}\n"
+                f"  Вход: {entry:.6g} → {cur_str}  |  {pnl_icon} <b>{pnl_sign}{pnl_pct:.1f}%</b>{usd_str}  |  {dur}\n"
+                f"  ⛔ SL: {sl:.6g if sl>0 else '—'}{sl_dist}  |  ✅ TP1: {tp1:.6g if tp1>0 else '—'}"
+                + (f"  |  TP{highest}✓" if highest>0 else "")
+            )
+
+        if pnl_list:
+            avg  = sum(pnl_list)/len(pnl_list)
+            sign = "+" if avg>=0 else ""
+            lines.append(f"\n📊 Позиций с ценой: {len(pnl_list)} | Ср. P&L: <b>{sign}{avg:.1f}%</b>")
+
+        _reply(m, "\n".join(lines))
 
     @bot.message_handler(commands=["redis_info"])
     def cmd_redis_info(m):
