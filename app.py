@@ -2612,6 +2612,8 @@ if bot:
 
     @bot.message_handler(commands=["start"])
     def cmd_start(m):
+        if not is_admin_user(m.from_user.id):
+            _reply(m, "⛔ Нет доступа."); return
         _reply(m, (
             "🚀 <b>Statham Trading Bot v2</b>\n\n"
             "Принимаю сигналы от TradingView,\n"
@@ -2619,67 +2621,10 @@ if bot:
             "👉 /help — список команд"
         ))
 
-    @bot.message_handler(commands=["pnl", "pnls"])
-    def cmd_pnl(m):
-        """✅ IMPROVEMENT #10: Live P&L — текущие позиции с расстоянием до SL/TP."""
-        if not is_admin_user(m.from_user.id):
-            _reply(m, "❌ Только для администраторов."); return
-        positions = load_positions()
-        if not positions:
-            _reply(m, "📭 Нет открытых позиций."); return
-        lines = ["💹 <b>Live P&L — Открытые позиции</b>\n"]
-        now_ts = int(time.time())
-        for pkey, pos in positions.items():
-            ticker    = pos.get("ticker", pkey)
-            direction = pos.get("direction", "?")
-            entry     = float(pos.get("entry_price") or 0)
-            sl        = float(pos.get("sl_price") or 0)
-            tp1       = float(pos.get("tp1_price") or 0)
-            lev       = int(pos.get("leverage") or 1)
-            exchange  = pos.get("exchange", "?")
-            created   = int(pos.get("created_at") or 0)
-            duration_min = (now_ts - created) // 60 if created else 0
-
-            # Текущая цена
-            cur_price = 0.0
-            try:
-                cur_price = ex_get_price(ticker, exchange)
-            except Exception:
-                pass
-
-            arrow = "🟢" if direction == "BUY" else "🔴"
-            side_l = "LONG" if direction == "BUY" else "SHORT"
-
-            # PnL %
-            pnl_pct = 0.0
-            if entry > 0 and cur_price > 0:
-                if direction == "BUY":
-                    pnl_pct = (cur_price - entry) / entry * 100 * lev
-                else:
-                    pnl_pct = (entry - cur_price) / entry * 100 * lev
-            pnl_icon = "✅" if pnl_pct > 0 else ("❌" if pnl_pct < 0 else "➖")
-
-            # Расстояние до SL/TP1
-            sl_dist = ""
-            tp_dist = ""
-            if sl > 0 and cur_price > 0:
-                sl_pct = abs(cur_price - sl) / cur_price * 100
-                sl_dist = f"{sl_pct:.2f}%"
-            if tp1 > 0 and cur_price > 0:
-                tp_pct = abs(tp1 - cur_price) / cur_price * 100
-                tp_dist = f"{tp_pct:.2f}%"
-
-            dur_str = f"{duration_min}м" if duration_min < 60 else f"{duration_min//60}ч{duration_min%60}м"
-            lines.append(
-                f"{arrow} <b>#{ticker}</b> {side_l} [{exchange}] {lev}x\n"
-                f"  Вход: {entry:.6g} → Текущая: {cur_price:.6g}\n"
-                f"  {pnl_icon} P&L: <b>{pnl_pct:+.2f}%</b> | Время: {dur_str}\n"
-                f"  ⛔ SL: {sl:.6g} (до SL: {sl_dist}) | ✅ TP1: {tp1:.6g} (до TP1: {tp_dist})\n"
-            )
-        _reply(m, "\n".join(lines))
-
     @bot.message_handler(commands=["help"])
     def cmd_help(m):
+        if not is_admin_user(m.from_user.id):
+            _reply(m, "⛔ Нет доступа."); return
         _reply(m, (
             "📋 <b>Команды Statham Bot v2</b>\n\n"
             "<b>📊 Статистика:</b>\n"
@@ -2709,6 +2654,8 @@ if bot:
 
     @bot.message_handler(commands=["stats"])
     def cmd_stats(m):
+        if not is_admin_user(m.from_user.id):
+            _reply(m, "⛔ Нет доступа."); return
         s      = load_stats()
         wins   = s.get("wins", 0)
         losses = s.get("losses", 0)
@@ -2844,6 +2791,8 @@ if bot:
 
     @bot.message_handler(commands=["stats_by_ticker"])
     def cmd_stats_by_ticker(m):
+        if not is_admin_user(m.from_user.id):
+            _reply(m, "⛔ Нет доступа."); return
         parts = m.text.split()
         if len(parts) < 2:
             _reply(m, "❌ Укажи тикер: /stats_by_ticker BTCUSDT")
@@ -2938,6 +2887,8 @@ if bot:
 
     @bot.message_handler(commands=["active"])
     def cmd_active(m):
+        if not is_admin_user(m.from_user.id):
+            _reply(m, "⛔ Нет доступа."); return
         positions = load_positions()
         if not positions:
             _reply(m, "🔵 Нет открытых позиций."); return
@@ -3045,6 +2996,8 @@ if bot:
 
     @bot.message_handler(commands=["pairs"])
     def cmd_pairs(m):
+        if not is_admin_user(m.from_user.id):
+            _reply(m, "⛔ Нет доступа."); return
         mode_bybit = ("🧪 TESTNET" if TESTNET else "🔴 LIVE") if BYBIT_AVAILABLE else "❌ не настроен"
         mode_bingx = ("🧪 DEMO" if BINGX_DEMO else "🔴 LIVE") if BINGX_AVAILABLE else "❌ не настроен"
         _reply(m, (
@@ -3217,6 +3170,8 @@ if bot:
     @bot.message_handler(commands=["pnl"])
     def cmd_pnl(m):
         """Быстрый Live P&L всех открытых позиций."""
+        if not is_admin_user(m.from_user.id):
+            _reply(m, "⛔ Нет доступа."); return
         positions = load_positions()
         if not positions:
             _reply(m, "💹 Нет открытых позиций."); return
