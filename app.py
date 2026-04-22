@@ -1268,20 +1268,26 @@ def _build_report(trades: list, title: str, show_last: int = 5,
                 if r.get("pnl") and r["pnl"].get("pnl_pct") != 0.0]
         if not vals: return ""
         avg = round(sum(vals)/len(vals), 1)
+        # Note: positive SL avg = BE/Trail stopped out in profit (correct!)
         return f"  <i>avg {'+'if avg>=0 else ''}{avg}%</i>"
 
+    # Classify SL records: new records have trail_active/be_active fields
+    # Old records (no fields) → separate "архив" bucket, cannot classify
     all_sl_recs = [r for r in trades if r.get("close_reason") == "sl_hit"
                    or r.get("result") in ("loss","partial")]
-    _sl_pure  = [r for r in all_sl_recs
-                 if not r.get("trail_active") and not r.get("be_active")
-                 and r.get("result") == "loss"]
-    _sl_be    = [r for r in all_sl_recs
-                 if r.get("be_active") and not r.get("trail_active")]
-    _sl_trail = [r for r in all_sl_recs if r.get("trail_active")]
-    _sl_old   = [r for r in sl_only
-                 if "trail_active" not in r and "be_active" not in r]
+    # New records: have trail_active or be_active fields stored
+    _sl_new    = [r for r in all_sl_recs if "trail_active" in r or "be_active" in r]
+    _sl_pure   = [r for r in _sl_new
+                  if not r.get("trail_active") and not r.get("be_active")]
+    _sl_be     = [r for r in _sl_new
+                  if r.get("be_active") and not r.get("trail_active")]
+    _sl_trail  = [r for r in _sl_new if r.get("trail_active")]
+    # Old records: cannot classify (mix of pure SL + BE + Trail pre-update)
+    _sl_legacy = [r for r in all_sl_recs
+                  if "trail_active" not in r and "be_active" not in r]
 
-    if _sl_pure or _sl_be or _sl_trail or _sl_old:
+    has_data = bool(_sl_pure or _sl_be or _sl_trail or _sl_legacy)
+    if has_data:
         text += "\n<b>Разбивка по SL:</b>\n"
         if _sl_pure:
             text += f"  ❌ Чистый SL: {len(_sl_pure)}x{_avg_pnl_sl(_sl_pure)}\n"
@@ -1289,15 +1295,16 @@ def _build_report(trades: list, title: str, show_last: int = 5,
             text += f"  🔒 BE-стоп: {len(_sl_be)}x{_avg_pnl_sl(_sl_be)}\n"
         if _sl_trail:
             text += f"  📈 Trail-стоп: {len(_sl_trail)}x{_avg_pnl_sl(_sl_trail)}\n"
-        if _sl_old:
-            sl_pnl_list = [r["pnl"]["pnl_pct"] for r in _sl_old
-                           if r.get("pnl") and r["pnl"].get("pnl_pct") != 0.0]
-            if sl_pnl_list:
-                avg_sl_pnl = round(sum(sl_pnl_list)/len(sl_pnl_list), 1)
-                _sl_sign = "+" if avg_sl_pnl > 0 else ""
-                text += f"  ❌ SL: {len(_sl_old)}x  <i>avg {_sl_sign}{avg_sl_pnl}%</i>\n"
+        if _sl_legacy:
+            leg_pnl = [r["pnl"]["pnl_pct"] for r in _sl_legacy
+                       if r.get("pnl") and r["pnl"].get("pnl_pct") != 0.0]
+            if leg_pnl:
+                avg_leg = round(sum(leg_pnl)/len(leg_pnl), 1)
+                _s = "+" if avg_leg >= 0 else ""
+                text += (f"  📦 Архив (до клас-ции): {len(_sl_legacy)}x"
+                         f"  <i>avg {_s}{avg_leg}% (вкл. BE/Trail)</i>\n")
             else:
-                text += f"  ❌ SL: {len(_sl_old)}x  <i>avg n/a</i>\n"
+                text += f"  📦 Архив (до клас-ции): {len(_sl_legacy)}x  <i>avg n/a</i>\n"
 
     # ── Топ тикеры (для недельного/месячного) ────────────────────────
     if show_top_tickers and total > 0:
@@ -2739,13 +2746,15 @@ if bot:
         # ── SL разбивка по типу ───────────────────────────────────────────────
         _all_sl = [r for r in history if r.get("close_reason") == "sl_hit"
                    or r.get("result") in ("loss", "partial")]
-        sl_pure   = [r for r in _all_sl if not r.get("trail_active") and not r.get("be_active")
-                     and r.get("result") == "loss"]
-        sl_be     = [r for r in _all_sl if r.get("be_active") and not r.get("trail_active")]
-        sl_trail  = [r for r in _all_sl if r.get("trail_active")]
-        # Fallback: old records without trail/be fields — classify by highest_tp
-        sl_partial = [r for r in _all_sl if r.get("result") == "partial"
-                      and not r.get("trail_active") and not r.get("be_active")]
+        # New records have trail_active/be_active fields; old don't
+        _sl_new    = [r for r in _all_sl if "trail_active" in r or "be_active" in r]
+        sl_pure    = [r for r in _sl_new
+                      if not r.get("trail_active") and not r.get("be_active")]
+        sl_be      = [r for r in _sl_new
+                      if r.get("be_active") and not r.get("trail_active")]
+        sl_trail   = [r for r in _sl_new if r.get("trail_active")]
+        sl_legacy  = [r for r in _all_sl
+                      if "trail_active" not in r and "be_active" not in r]
 
         def _sl_avg(recs):
             vals = [r["pnl"]["pnl_pct"] for r in recs
@@ -2753,14 +2762,26 @@ if bot:
             if not vals: return ""
             avg = round(sum(vals)/len(vals), 1)
             s = "+" if avg >= 0 else ""
+            # Positive avg for SL = BE/Trail exit in profit (correct!)
             return f"  <i>avg {s}{avg}%</i>"
 
         sl_breakdown = "\n<b>Разбивка по SL:</b>\n"
-        sl_breakdown += f"  ❌ Чистый SL: {len(sl_pure)}x{_sl_avg(sl_pure)}\n"
-        sl_breakdown += f"  🔒 BE-стоп (после TP1): {len(sl_be)}x{_sl_avg(sl_be)}\n"
-        sl_breakdown += f"  📈 Trail-стоп: {len(sl_trail)}x{_sl_avg(sl_trail)}\n"
-        if sl_partial:
-            sl_breakdown += f"  🔶 Partial (TP+SL): {len(sl_partial)}x{_sl_avg(sl_partial)}\n"
+        if sl_pure:
+            sl_breakdown += f"  ❌ Чистый SL: {len(sl_pure)}x{_sl_avg(sl_pure)}\n"
+        if sl_be:
+            sl_breakdown += f"  🔒 BE-стоп: {len(sl_be)}x{_sl_avg(sl_be)}\n"
+        if sl_trail:
+            sl_breakdown += f"  📈 Trail-стоп: {len(sl_trail)}x{_sl_avg(sl_trail)}\n"
+        if sl_legacy:
+            leg_v = [r["pnl"]["pnl_pct"] for r in sl_legacy
+                     if r.get("pnl") and r["pnl"].get("pnl_pct") != 0.0]
+            if leg_v:
+                avg_leg = round(sum(leg_v)/len(leg_v), 1)
+                _sg = "+" if avg_leg >= 0 else ""
+                sl_breakdown += (f"  📦 Архив (до клас-ции): {len(sl_legacy)}x"
+                                 f"  <i>avg {_sg}{avg_leg}% (вкл. BE/Trail)</i>\n")
+            else:
+                sl_breakdown += f"  📦 Архив: {len(sl_legacy)}x  <i>avg n/a</i>\n"
 
         _reply(m, (
             f"📊 <b>Статистика Statham Strategy</b>\n\n"
