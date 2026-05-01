@@ -3229,11 +3229,13 @@ if bot:
 
             cur_str = f"{cur:.6g}" if cur>0 else "—"
             usd_str = f" ({usd_sign}{pnl_usd:.2f}$)" if entry>0 and cur>0 else ""
+            sl_str  = f"{sl:.6g}" if sl>0 else "—"
+            tp1_str = f"{tp1:.6g}" if tp1>0 else "—"
 
             lines.append(
                 f"{dir_icon} <b>#{sym}</b> {dirn} [{exch_tag}] {lev}x{trail_be}\n"
                 f"  Вход: {entry:.6g} → {cur_str}  |  {pnl_icon} <b>{pnl_sign}{pnl_pct:.1f}%</b>{usd_str}  |  {dur}\n"
-                f"  ⛔ SL: {sl:.6g if sl>0 else '—'}{sl_dist}  |  ✅ TP1: {tp1:.6g if tp1>0 else '—'}"
+                f"  ⛔ SL: {sl_str}{sl_dist}  |  ✅ TP1: {tp1_str}"
                 + (f"  |  TP{highest}✓" if highest>0 else "")
             )
 
