@@ -140,9 +140,9 @@ try:
 except Exception:
     PAIR_SETTINGS = {}
 
-# ✅ IMPROVEMENT #3: Оптимизировано по бэктесту — TP6 редко достигается (18%)
-# Фокус на TP1-3: 90% объёма закрывается там, runner на TP4-5
-TP_CLOSE_PCT = {1: 0.40, 2: 0.30, 3: 0.20, 4: 0.07, 5: 0.03, 6: 0.00}
+# TP_CLOSE_PCT: распределение частичных закрытий по уровням TP
+# TP1-2: 60% объёма быстрый выход, TP3: 20% — основная цель, TP4-6: 20% runner
+TP_CLOSE_PCT = {1: 0.30, 2: 0.30, 3: 0.20, 4: 0.07, 5: 0.03, 6: 0.10}
 
 
 def calc_trade_pnl(pos: dict, sl_exit_price: float | None = None) -> dict:
