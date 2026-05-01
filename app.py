@@ -1806,53 +1806,57 @@ def handle_tp_hit(payload: dict):
             if _trade_already_closed(instance_id):
                 write_log(f"TP_DUPLICATE_SKIP | {ticker} TP{tp_num} | already closed")
                 return  # genuine duplicate — skip silently
-            # Bug 2 Fix: position missing but NOT a duplicate → mark and fall through
+            # Bug 2 Fix: position missing but NOT a duplicate → mark and return
             _found_pos = False
-        elif pos.get(f"tp{tp_num}_hit"):
-            write_log(f"TP_DUPLICATE_SKIP | {ticker} TP{tp_num} | already applied")
-            return
-
-        exchange = pos.get("exchange", "bybit")
-        total_qty = pos["total_qty"]
-        remaining = pos["remaining_qty"]
-        opp_side = pos["opp_side"]
-        close_qty = round(total_qty * TP_CLOSE_PCT.get(tp_num, 0.0), 8)
-        close_qty = min(close_qty, remaining)
-        min_q = ex_min_qty(ticker, exchange) if exchange != "none" else 0.0
-
-        if exchange != "none":
-            if pos.get("use_exchange_tps"):
-                # TP-ордер уже исполнен биржей как лимитная заявка
-                write_log(f"TP_HIT_EXCHANGE | {ticker} TP{tp_num} | limit order filled by exchange")
-            else:
-                if close_qty < min_q:
-                    return
-                try:
-                    ex_place_market(ticker, opp_side, close_qty, True, exchange)
-                except Exception as e:
-                    write_log(f"TP_HIT_ERR | {ticker} TP{tp_num} ({exchange}) | {e}")
-                    return
-        elif close_qty <= 0:
-            close_qty = 0.0
-
-        new_remaining = max(0.0, remaining - close_qty)
-        pos[f"tp{tp_num}_hit"] = True
-        pos["remaining_qty"] = new_remaining
-        highest_tp = _highest_tp_hit(pos)
-
-        if tp_num >= 2 and not pos["trail_active"]:
-            pos["trail_active"] = True
-            pos["trail_sl"]     = pos.get("sl_price")
-
-        if new_remaining <= min_q or tp_num >= 6:
-            if exchange != "none":
-                ex_cancel_all(ticker, exchange)
-            positions.pop(pkey, None)
-            final_close = True
+            # Exit early — position logic below requires valid pos, Telegram msg sent after lock
         else:
-            positions[pkey] = pos
-        pos_snapshot = dict(pos)
-        save_positions(positions)
+            # Position exists — check if TP already hit
+            if pos.get(f"tp{tp_num}_hit"):
+                write_log(f"TP_DUPLICATE_SKIP | {ticker} TP{tp_num} | already applied")
+                return
+
+            # Process TP hit
+            exchange = pos.get("exchange", "bybit")
+            total_qty = pos["total_qty"]
+            remaining = pos["remaining_qty"]
+            opp_side = pos["opp_side"]
+            close_qty = round(total_qty * TP_CLOSE_PCT.get(tp_num, 0.0), 8)
+            close_qty = min(close_qty, remaining)
+            min_q = ex_min_qty(ticker, exchange) if exchange != "none" else 0.0
+
+            if exchange != "none":
+                if pos.get("use_exchange_tps"):
+                    # TP-ордер уже исполнен биржей как лимитная заявка
+                    write_log(f"TP_HIT_EXCHANGE | {ticker} TP{tp_num} | limit order filled by exchange")
+                else:
+                    if close_qty < min_q:
+                        return
+                    try:
+                        ex_place_market(ticker, opp_side, close_qty, True, exchange)
+                    except Exception as e:
+                        write_log(f"TP_HIT_ERR | {ticker} TP{tp_num} ({exchange}) | {e}")
+                        return
+            elif close_qty <= 0:
+                close_qty = 0.0
+
+            new_remaining = max(0.0, remaining - close_qty)
+            pos[f"tp{tp_num}_hit"] = True
+            pos["remaining_qty"] = new_remaining
+            highest_tp = _highest_tp_hit(pos)
+
+            if tp_num >= 2 and not pos["trail_active"]:
+                pos["trail_active"] = True
+                pos["trail_sl"]     = pos.get("sl_price")
+
+            if new_remaining <= min_q or tp_num >= 6:
+                if exchange != "none":
+                    ex_cancel_all(ticker, exchange)
+                positions.pop(pkey, None)
+                final_close = True
+            else:
+                positions[pkey] = pos
+            pos_snapshot = dict(pos)
+            save_positions(positions)
 
     # Bug 2 Fix: if no position was found, still forward the signal to Telegram
     if not _found_pos:
